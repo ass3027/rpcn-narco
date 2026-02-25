@@ -11,6 +11,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
+use parking_lot::RwLock;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
@@ -19,6 +20,7 @@ use crate::server::GameTracker;
 use crate::server::Server;
 use crate::server::client::{COMMUNICATION_ID_SIZE, ComId, TerminateWatch, com_id_to_string};
 use crate::server::database::db_score::DbBoardInfo;
+use crate::server::room_manager::RoomManager;
 use crate::server::score_cache::{GetScoreResultCache, ScoresCache};
 
 struct CachedResponse {
@@ -70,6 +72,7 @@ pub struct StatServer {
 	cache_life: u32,
 	game_tracker: Arc<GameTracker>,
 	score_cache: Arc<ScoresCache>,
+	room_manager: Arc<RwLock<RoomManager>>,
 	json_cache: Arc<JsonCache>,
 }
 
@@ -97,6 +100,7 @@ impl Server {
 		}
 
 		let score_cache = self.score_cache.clone();
+		let room_manager = self.room_manager.clone();
 
 		if let Some((host, port)) = &bind_addr {
 			let str_addr = host.to_owned() + ":" + port;
@@ -113,7 +117,7 @@ impl Server {
 
 			info!("Stat server now waiting for connections on {}", str_addr);
 
-			let mut stat_server = StatServer::new(listener, term_watch, path, cache_life, game_tracker, score_cache);
+			let mut stat_server = StatServer::new(listener, term_watch, path, cache_life, game_tracker, score_cache, room_manager);
 
 			tokio::task::spawn(async move {
 				stat_server.server_proc().await;
@@ -125,7 +129,15 @@ impl Server {
 }
 
 impl StatServer {
-	fn new(listener: TcpListener, term_watch: TerminateWatch, path: String, cache_life: u32, game_tracker: Arc<GameTracker>, score_cache: Arc<ScoresCache>) -> StatServer {
+	fn new(
+		listener: TcpListener,
+		term_watch: TerminateWatch,
+		path: String,
+		cache_life: u32,
+		game_tracker: Arc<GameTracker>,
+		score_cache: Arc<ScoresCache>,
+		room_manager: Arc<RwLock<RoomManager>>,
+	) -> StatServer {
 		StatServer {
 			listener,
 			term_watch,
@@ -133,6 +145,7 @@ impl StatServer {
 			cache_life,
 			game_tracker,
 			score_cache,
+			room_manager,
 			json_cache: Arc::new(JsonCache::new()),
 		}
 	}
@@ -159,10 +172,11 @@ impl StatServer {
 						let cache_life = self.cache_life;
 						let game_tracker = self.game_tracker.clone();
 						let score_cache = self.score_cache.clone();
+						let room_manager = self.room_manager.clone();
 						let json_cache = self.json_cache.clone();
 
 						tokio::task::spawn(async move {
-							if let Err(err) = http1::Builder::new().keep_alive(false).serve_connection(io, service_fn(|r| StatServer::handle_stat_server_req(r, &path, cache_life, game_tracker.clone(), score_cache.clone(), json_cache.clone()))).await {
+							if let Err(err) = http1::Builder::new().keep_alive(false).serve_connection(io, service_fn(|r| StatServer::handle_stat_server_req(r, &path, cache_life, game_tracker.clone(), score_cache.clone(), room_manager.clone(), json_cache.clone()))).await {
 								warn!("Stat: Error serving connection: {}", err);
 							}
 						});
@@ -176,11 +190,11 @@ impl StatServer {
 		info!("GameTracker::server_proc terminating");
 	}
 
-	fn handle_usage_req(cache_life: u32, game_tracker: &Arc<GameTracker>, json_cache: &Arc<JsonCache>) -> Result<Response<String>, Infallible> {
+	fn handle_usage_req(cache_life: u32, game_tracker: &Arc<GameTracker>, room_manager: &Arc<RwLock<RoomManager>>, json_cache: &Arc<JsonCache>) -> Result<Response<String>, Infallible> {
 		if cache_life == 0 {
 			return Ok(Response::builder()
 				.header("Content-Type", "application/json")
-				.body(StatServer::game_tracker_to_json(game_tracker))
+				.body(StatServer::game_tracker_to_json(game_tracker, room_manager))
 				.unwrap());
 		}
 
@@ -191,7 +205,7 @@ impl StatServer {
 		if is_stale {
 			*response = Response::builder()
 				.header("Content-Type", "application/json")
-				.body(StatServer::game_tracker_to_json(game_tracker))
+				.body(StatServer::game_tracker_to_json(game_tracker, room_manager))
 				.unwrap();
 		}
 
@@ -284,6 +298,7 @@ impl StatServer {
 		cache_life: u32,
 		game_tracker: Arc<GameTracker>,
 		score_cache: Arc<ScoresCache>,
+		room_manager: Arc<RwLock<RoomManager>>,
 		json_cache: Arc<JsonCache>,
 	) -> Result<Response<String>, Infallible> {
 		if req.method() != Method::GET {
@@ -295,7 +310,7 @@ impl StatServer {
 		let score_prefix = format!("{}/score/", path);
 
 		if req_path == usage_path {
-			return StatServer::handle_usage_req(cache_life, &game_tracker, &json_cache);
+			return StatServer::handle_usage_req(cache_life, &game_tracker, &room_manager, &json_cache);
 		}
 
 		if let Some(rest) = req_path.strip_prefix(&score_prefix) {
@@ -318,7 +333,7 @@ impl StatServer {
 		Ok(Response::new("".to_owned()))
 	}
 
-	fn game_tracker_to_json(game_tracker: &Arc<GameTracker>) -> String {
+	fn game_tracker_to_json(game_tracker: &Arc<GameTracker>, room_manager: &Arc<RwLock<RoomManager>>) -> String {
 		let psn_games: Vec<(String, i64, Vec<String>)> = game_tracker
 			.psn_games
 			.read()
@@ -380,8 +395,23 @@ impl StatServer {
 		add_games_with_hints(&mut res, "psn_games", &psn_games);
 		add_games(&mut res, "ticket_games", &ticket_games);
 
-		res += "\n}";
+		let players_map = room_manager.read().get_players_by_com_id();
+		if !players_map.is_empty() {
+			let _ = writeln!(res, ",\n    \"players_id\": {{");
+			let entries: Vec<_> = players_map.iter().collect();
+			for (index, (com_id, users)) in entries.iter().enumerate() {
+				let _ = writeln!(res, "        \"{}\": {{", com_id_to_string(com_id));
+				for (i, (ip, name)) in users.iter().enumerate() {
+					let comma = if i != users.len() - 1 { "," } else { "" };
+					let _ = write!(res, "            \"{}\": \"{}\"{}", ip, sanitize_for_json(name), comma);
+					res += "\n";
+				}
+				res += if index != entries.len() - 1 { "        },\n" } else { "        }\n" };
+			}
+			res += "    }";
+		}
 
+		res += "\n}";
 		res
 	}
 
