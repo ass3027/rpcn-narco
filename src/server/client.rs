@@ -453,6 +453,7 @@ impl Client {
 
 		if let Some(ref cur_com_id) = client.current_game.0 {
 			client.shared.game_tracker.decrease_count_psn(cur_com_id);
+			client.shared.game_tracker.remove_player(cur_com_id, &client.client_info.online_name);
 			client.current_game.0 = None;
 		}
 
@@ -763,15 +764,29 @@ impl Client {
 		let com_id = data.get_com_id();
 		let final_com_id = self.config.read().get_server_redirection(com_id);
 
+		// IP 미리 추출
+		let ip_str = {
+			let client_infos = self.shared.client_infos.read();
+			if let Some(info) = client_infos.get(&self.client_info.user_id) {
+				let ip = info.signaling_info.read().addr_p2p_ipv4.0;
+				format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+			} else {
+				String::from("0.0.0.0")
+			}
+		};
+
 		if let Some(ref mut cur_com_id) = self.current_game.0 {
 			if *cur_com_id != final_com_id {
 				self.shared.game_tracker.decrease_count_psn(cur_com_id);
+				self.shared.game_tracker.remove_player(cur_com_id, &self.client_info.online_name); // 추가
 				*cur_com_id = final_com_id;
 				self.shared.game_tracker.increase_count_psn(&final_com_id);
+				self.shared.game_tracker.add_player(&final_com_id, &self.client_info.online_name, &ip_str); // 추가
 			}
 		} else {
 			self.current_game.0 = Some(final_com_id);
 			self.shared.game_tracker.increase_count_psn(&final_com_id);
+			self.shared.game_tracker.add_player(&final_com_id, &self.client_info.online_name, &ip_str); // 추가
 		}
 
 		final_com_id

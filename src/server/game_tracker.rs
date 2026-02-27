@@ -9,6 +9,7 @@ use crate::server::client::ComId;
 pub struct GameInfo {
 	pub num_users: AtomicI64,
 	pub name_hints: RwLock<HashSet<String>>,
+	pub players: RwLock<HashMap<String, String>>,
 }
 
 pub struct GameTracker {
@@ -65,6 +66,7 @@ impl GameTracker {
 			.or_insert_with(|| GameInfo {
 				num_users: AtomicI64::new(0),
 				name_hints: RwLock::new(HashSet::new()),
+				players: RwLock::new(HashMap::new()),
 			})
 			.num_users
 			.fetch_add(to_add, Ordering::SeqCst);
@@ -100,5 +102,19 @@ impl GameTracker {
 
 	pub fn decrease_count_ticket(&self, service_id: &str) {
 		self.add_value_ticket(service_id, -1);
+	}
+
+	pub fn add_player(&self, com_id: &ComId, online_name: &str, ip: &str) {
+		let psn_games = self.psn_games.read();
+		if let Some(game_info) = psn_games.get(com_id) {
+			game_info.players.write().insert(online_name.to_string(), ip.to_string());
+		}
+	}
+
+	pub fn remove_player(&self, com_id: &ComId, online_name: &str) {
+		let psn_games = self.psn_games.read();
+		if let Some(game_info) = psn_games.get(com_id) {
+			game_info.players.write().remove(online_name);
+		}
 	}
 }
