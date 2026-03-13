@@ -268,6 +268,7 @@ enum CommandType {
 	UpdateServersCfg,
 	BanUser,
 	DelUser,
+	SearchRoomAll,
 }
 
 #[repr(u8)]
@@ -676,6 +677,7 @@ impl Client {
 			CommandType::JoinRoom => self.req_join_room(data, reply).await,
 			CommandType::LeaveRoom => self.req_leave_room(data, reply).await,
 			CommandType::SearchRoom => self.req_search_room(data, reply),
+			CommandType::SearchRoomAll => self.req_search_room_all(data, reply),
 			CommandType::GetRoomDataExternalList => self.req_get_roomdata_external_list(data, reply),
 			CommandType::GetRoomMemberDataExternalList => self.req_get_room_member_data_external_list(data, reply),
 			CommandType::SetRoomDataExternal => self.req_set_roomdata_external(data),

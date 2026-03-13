@@ -123,6 +123,27 @@ message RoomDataExternal {
   repeated BinAttr roomBinAttrExternal = 17;
 }
 
+message RoomDataExternalAll {
+  uint16 serverId = 1;
+  uint32 worldId = 2;
+  uint16 publicSlotNum = 3;
+  uint16 privateSlotNum = 4;
+  uint64 lobbyId = 5;
+  uint64 roomId = 6;
+  uint16 openPublicSlotNum = 7;
+  uint16 maxSlot = 8;
+  uint16 openPrivateSlotNum = 9;
+  uint16 curMemberNum = 10;
+  uint64 passwordSlotMask = 11;
+  UserInfo owner = 12;
+  repeated RoomGroup roomGroup = 13;
+  uint32 flagAttr = 14;
+  repeated IntAttr roomSearchableIntAttrExternal = 15;
+  repeated BinAttr roomSearchableBinAttrExternal = 16;
+  repeated BinAttr roomBinAttrExternal = 17;
+  repeated RoomMemberDataExternal users = 18;
+}
+
 message IntSearchFilter {
   uint8 searchOperator = 1;
   IntAttr attr = 2;
@@ -160,6 +181,12 @@ message SearchRoomResponse {
   uint32 startIndex = 1;
   uint32 total = 2;
   repeated RoomDataExternal rooms = 3;
+}
+
+message SearchRoomAllResponse {
+  uint32 startIndex = 1;
+  uint32 total = 2;
+  repeated RoomDataExternalAll rooms = 3;
 }
 
 message CreateJoinRoomRequest {

@@ -687,6 +687,99 @@ impl Room {
 		}
 	}
 
+	pub fn to_RoomDataExternalAll(&self, search_option: i32, inc_attrs: &Vec<u16>) -> RoomDataExternalAll {
+		let owner_info = if (search_option & 0x7) != 0 {
+			let owner_user = self.users.get(&self.owner).unwrap();
+			let mut info = UserInfo {
+				np_id: owner_user.npid.clone(),
+				online_name: String::new(),
+				avatar_url: String::new(),
+			};
+
+			if (search_option & 0x2) != 0 {
+				info.online_name = owner_user.online_name.clone();
+			}
+			if (search_option & 0x4) != 0 {
+				info.avatar_url = owner_user.avatar_url.clone();
+			}
+
+			Some(info)
+		} else {
+			None
+		};
+
+		let room_group: Vec<RoomGroup> = self.group_config.iter().map(|group| group.to_protobuf()).collect();
+
+		let mut vec_searchint = Vec::new();
+		let mut vec_searchbin = Vec::new();
+		let mut vec_binattrexternal = Vec::new();
+
+		'inc_loop: for inc_attr in inc_attrs {
+			match *inc_attr {
+				SCE_NP_MATCHING2_ROOM_SEARCHABLE_INT_ATTR_EXTERNAL_1_ID..=SCE_NP_MATCHING2_ROOM_SEARCHABLE_INT_ATTR_EXTERNAL_8_ID => {
+					vec_searchint.push(self.search_int_attr[(*inc_attr - SCE_NP_MATCHING2_ROOM_SEARCHABLE_INT_ATTR_EXTERNAL_1_ID) as usize].to_protobuf());
+				}
+				SCE_NP_MATCHING2_ROOM_SEARCHABLE_BIN_ATTR_EXTERNAL_1_ID => {
+					vec_searchbin.push(self.search_bin_attr.to_protobuf());
+				}
+				SCE_NP_MATCHING2_ROOM_BIN_ATTR_EXTERNAL_1_ID..=SCE_NP_MATCHING2_ROOM_BIN_ATTR_EXTERNAL_2_ID => {
+					vec_binattrexternal.push(self.bin_attr_external[(*inc_attr - SCE_NP_MATCHING2_ROOM_BIN_ATTR_EXTERNAL_1_ID) as usize].to_protobuf());
+				}
+				v => {
+					warn!("Invalid ID included in to_inc in to_RoomDataExternal: {}", v);
+					continue 'inc_loop;
+				}
+			}
+		}
+
+		let mut max_private_slots = 0u16;
+		let mut open_public_slots = 0u16;
+		let mut open_private_slots = 0u16;
+
+		if self.room_password.is_some() {
+			for i in 0..self.max_slot as usize {
+				if (self.password_slot_mask & (1 << (63 - i))) != 0 {
+					max_private_slots += 1;
+					if !self.slots[i] {
+						open_private_slots += 1;
+					}
+				} else if !self.slots[i] {
+					open_public_slots += 1;
+				}
+			}
+		} else {
+			open_public_slots = self.max_slot;
+		}
+
+		let max_public_slots = self.max_slot - max_private_slots;
+		
+		let mut room_users = Vec::new();
+		for user in self.users.values() {
+			room_users.push(user.to_roomMemberDataExternal());
+		}
+
+		RoomDataExternalAll {
+			server_id: Uint16::new_from_value(self.server_id),
+			world_id: self.world_id,
+			public_slot_num: Uint16::new_from_value(max_public_slots),
+			private_slot_num: Uint16::new_from_value(max_private_slots),
+			lobby_id: self.lobby_id,
+			room_id: self.room_id,
+			open_public_slot_num: Uint16::new_from_value(open_public_slots),
+			max_slot: Uint16::new_from_value(self.max_slot),
+			open_private_slot_num: Uint16::new_from_value(open_private_slots),
+			cur_member_num: Uint16::new_from_value(self.users.len() as u16), // Verification?
+			password_slot_mask: self.password_slot_mask,
+			owner: owner_info,
+			room_group,
+			flag_attr: self.flag_attr,
+			room_searchable_int_attr_external: vec_searchint,
+			room_searchable_bin_attr_external: vec_searchbin,
+			room_bin_attr_external: vec_binattrexternal,
+			users: room_users
+		}
+	}
+
 	pub fn get_room_member_update_info(&self, member_id: u16, event_cause: EventCause, user_opt_data: Option<&PresenceOptionData>) -> RoomMemberUpdateInfo {
 		assert!(self.users.contains_key(&member_id));
 		let user = self.users.get(&member_id).unwrap();
@@ -748,6 +841,109 @@ impl Room {
 			return Ok(false);
 		}
 
+		for intfilter in &req.int_filter {
+			let op = intfilter.search_operator.get_verified()?;
+			let attr = intfilter.attr.as_ref();
+			if attr.is_none() {
+				warn!("intFilter with no attr!");
+				continue;
+			}
+			let attr = attr.unwrap();
+			let id = attr.id.get_verified()?;
+			let num = attr.num;
+
+			if id < SCE_NP_MATCHING2_ROOM_SEARCHABLE_INT_ATTR_EXTERNAL_1_ID || id > SCE_NP_MATCHING2_ROOM_SEARCHABLE_INT_ATTR_EXTERNAL_8_ID {
+				warn!("Invalid Room IntAttr ID in search parameters: {}", id);
+				return Ok(false);
+			}
+
+			// Find matching id
+			let found_intsearch = &self.search_int_attr[(id - SCE_NP_MATCHING2_ROOM_SEARCHABLE_INT_ATTR_EXTERNAL_1_ID) as usize];
+			let op: Option<SceNpMatching2Operator> = FromPrimitive::from_u8(op);
+			if op.is_none() {
+				warn!("Unsupported op in int search filter");
+				return Ok(false);
+			}
+			let op = op.unwrap();
+
+			match op {
+				SceNpMatching2Operator::OperatorEq => {
+					if found_intsearch.attr != num {
+						return Ok(false);
+					}
+				}
+				SceNpMatching2Operator::OperatorNe => {
+					if found_intsearch.attr == num {
+						return Ok(false);
+					}
+				}
+				SceNpMatching2Operator::OperatorLt => {
+					if found_intsearch.attr >= num {
+						return Ok(false);
+					}
+				}
+				SceNpMatching2Operator::OperatorLe => {
+					if found_intsearch.attr > num {
+						return Ok(false);
+					}
+				}
+				SceNpMatching2Operator::OperatorGt => {
+					if found_intsearch.attr <= num {
+						return Ok(false);
+					}
+				}
+				SceNpMatching2Operator::OperatorGe => {
+					if found_intsearch.attr < num {
+						return Ok(false);
+					}
+				}
+			}
+		}
+
+		for binfilter in &req.bin_filter {
+			let op = binfilter.search_operator.get_verified()?;
+			let attr = binfilter.attr.as_ref();
+			if attr.is_none() {
+				continue;
+			}
+			let attr = attr.unwrap();
+			let id = attr.id.get_verified()?;
+			let data = &attr.data;
+
+			if id != SCE_NP_MATCHING2_ROOM_SEARCHABLE_BIN_ATTR_EXTERNAL_1_ID {
+				warn!("Invalid Search BinAttr ID in search parameters: {}", id);
+				return Ok(false);
+			}
+
+			let op: Option<SceNpMatching2Operator> = FromPrimitive::from_u8(op);
+			if op.is_none() {
+				warn!("Unsupported op in bin search filter");
+				return Ok(false);
+			}
+			let op = op.unwrap();
+
+			// Unsure if cur_size should be compared to data's size
+			let len_compare = std::cmp::min(data.len(), self.search_bin_attr.attr.len());
+			let equality = self.search_bin_attr.attr[0..len_compare] == data[0..len_compare];
+
+			match op {
+				SceNpMatching2Operator::OperatorEq => {
+					if !equality {
+						return Ok(false);
+					}
+				}
+				SceNpMatching2Operator::OperatorNe => {
+					if equality {
+						return Ok(false);
+					}
+				}
+				_ => panic!("Non EQ/NE in binfilter!"),
+			}
+		}
+		Ok(true)
+	}
+
+	pub fn is_match_all(&self, req: &SearchRoomRequest) -> Result<bool, ErrorType> {
 		for intfilter in &req.int_filter {
 			let op = intfilter.search_operator.get_verified()?;
 			let attr = intfilter.attr.as_ref();
@@ -1459,6 +1655,67 @@ impl RoomManager {
 		}
 
 		let resp = SearchRoomResponse {
+			start_index: startindex,
+			total: matching_rooms.len() as u32,
+			rooms,
+		};
+		Ok(resp.encode_to_vec())
+	}
+
+	pub fn search_room_all(&self, com_id: &ComId, req: &SearchRoomRequest) -> Result<Vec<u8>, ErrorType> {
+		let world_id = req.world_id;
+		let lobby_id = req.lobby_id;
+
+		let startindex = if req.range_filter_start_index == 0 {
+			info!("SearchRoomRequest.startIndex was 0!");
+			1
+		} else {
+			req.range_filter_start_index
+		};
+
+		let max = if req.range_filter_max == 0 || req.range_filter_max > 20 {
+			warn!("SearchRoomRequest.max was invalid: {}", req.range_filter_max);
+			20
+		} else {
+			req.range_filter_max
+		};
+
+		let mut list = None;
+		if world_id != 0 {
+			list = self.world_rooms.get(&(*com_id, world_id));
+		} else if lobby_id != 0 {
+			list = self.lobby_rooms.get(&(*com_id, lobby_id));
+		}
+
+		let mut matching_rooms = Vec::new();
+
+		if let Some(room_list) = list {
+			for room_id in room_list.iter() {
+				let room = self.get_room(com_id, *room_id);
+				if room.is_match_all(req)? {
+					matching_rooms.push(room);
+				}
+			}
+		}
+
+		let mut rooms = Vec::new();
+
+		if matching_rooms.len() >= startindex as usize {
+			let mut inc_attrs: Vec<u16> = Vec::with_capacity(req.attr_id.len());
+			for a in &req.attr_id {
+				inc_attrs.push(a.get_verified()?);
+			}
+
+			let start = startindex as usize - 1;
+			let num_to_get = std::cmp::min(matching_rooms.len() - start, max as usize);
+			let end = start + num_to_get;
+
+			for room in &matching_rooms[start..end] {
+				rooms.push(room.to_RoomDataExternalAll(req.option, &inc_attrs));
+			}
+		}
+
+		let resp = SearchRoomAllResponse {
 			start_index: startindex,
 			total: matching_rooms.len() as u32,
 			rooms,

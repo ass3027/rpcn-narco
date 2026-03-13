@@ -162,6 +162,14 @@ impl Client {
 		Ok(ErrorType::NoError)
 	}
 
+	pub fn req_search_room_all(&mut self, data: &mut StreamExtractor, reply: &mut Vec<u8>) -> Result<ErrorType, ErrorType> {
+		let (com_id, search_req) = self.get_com_and_pb::<SearchRoomRequest>(data)?;
+
+		let resp = self.shared.room_manager.read().search_room_all(&com_id, &search_req)?;
+		Client::add_data_packet(reply, &resp);
+		Ok(ErrorType::NoError)
+	}
+
 	pub fn req_get_roomdata_external_list(&mut self, data: &mut StreamExtractor, reply: &mut Vec<u8>) -> Result<ErrorType, ErrorType> {
 		let (com_id, getdata_req) = self.get_com_and_pb::<GetRoomDataExternalListRequest>(data)?;
 
