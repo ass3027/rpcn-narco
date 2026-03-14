@@ -272,7 +272,7 @@ impl SignalParam {
 	}
 }
 
-struct RoomUser {
+pub(crate) struct RoomUser {
 	user_id: i64,
 	pub(crate) npid: String,
 	pub(crate) online_name: String,
