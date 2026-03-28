@@ -1511,7 +1511,7 @@ impl RoomManager {
 		))
 	}
 
-	pub fn leave_room(&mut self, com_id: &ComId, room_id: u64, user_id: i64) -> Result<(bool, HashSet<i64>, Option<String>), ErrorType> {
+	pub fn leave_room(&mut self, com_id: &ComId, room_id: u64, user_id: i64) -> Result<(bool, HashSet<i64>), ErrorType> {
 		if !self.room_exists(com_id, room_id) {
 			warn!("Attempted to leave a non existing room");
 			return Err(ErrorType::RoomMissing);

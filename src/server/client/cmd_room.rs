@@ -92,7 +92,21 @@ impl Client {
 	}
 
 	pub async fn leave_room(&self, com_id: &ComId, room_id: u64, opt_data: Option<&PresenceOptionData>, event_cause: EventCause) -> ErrorType {
-		let (destroyed, users, user_data, opponent_npid);
+		let opponent_npid = {
+			let room_manager = self.shared.room_manager.read();
+			if room_manager.room_exists(com_id, room_id) {
+				let room = room_manager.get_room(com_id, room_id);
+				if room.users.len() == 2 {
+					room.users.values().find(|u| u.user_id != self.client_info.user_id).map(|u| u.npid.clone())
+				} else {
+					None
+				}
+			} else {
+				None
+			}
+		};
+
+		let (destroyed, users, user_data);
 		{
 			let mut room_manager = self.shared.room_manager.write();
 			if !room_manager.room_exists(com_id, room_id) {
@@ -113,7 +127,7 @@ impl Client {
 			if let Err(e) = res {
 				return e;
 			}
-			let (destroyed_toa, users_toa, opponent_toa) = res.unwrap();
+			let (destroyed_toa, users_toa) = res.unwrap();
 			destroyed = destroyed_toa;
 			users = users_toa;
 			opponent_npid = opponent_toa;
@@ -124,7 +138,6 @@ impl Client {
 			let my_npid = self.client_info.npid.clone();
 			let opp_npid_clone = opp_npid.clone();
 			let mut pairs = self.shared.rematch_pairs.write();
-			// 양방향으로 저장 (서로가 서로를 찾을 수 있게끔)
 			pairs.insert(my_npid.clone(), (opp_npid_clone.clone(), std::time::Instant::now()));
 			pairs.insert(opp_npid_clone, (my_npid, std::time::Instant::now()));
 			info!("Rematch pair registered: {} <-> {}", self.client_info.npid, opp_npid);
