@@ -170,14 +170,14 @@ impl Client {
 		let (com_id, search_req) = self.get_com_and_pb::<SearchRoomRequest>(data)?;
 
 		// rematch 페어 확인
-		let my_npid = &self.client_info.npid;
+		let my_npid = self.client_info.npid.clone();
 		let opponent_npid = {
 			let mut pairs = self.shared.rematch_pairs.write();
 
 			// 30초 넘은 페어는 정리
-			pairs.retain(|_, (_, t)| t.elapsed().as_secs() < 30);
+			pairs.retain(|_, (_, t)| t.elapsed().as_secs() < 15);
 
-			pairs.get(my_npid).map(|(opp, _)| opp.clone())
+			pairs.get(&my_npid).map(|(opp, _)| opp.clone())
 		};
 
 		if let Some(ref opp_npid) = opponent_npid {
@@ -200,7 +200,7 @@ impl Client {
 				// 페어 삭제 (매칭 완료)
 				drop(room_manager);
 				let mut pairs = self.shared.rematch_pairs.write();
-				pairs.remove(my_npid);
+				pairs.remove(&my_npid);
 				pairs.remove(opp_npid);
 
 				info!("Rematch triggered: {} → {}'s room", my_npid, opp_npid);
@@ -213,6 +213,21 @@ impl Client {
 				Client::add_data_packet(reply, &resp.encode_to_vec());
 				return Ok(ErrorType::NoError);
 			}
+
+			// 알파벳상 작은 쪽 = 빈 결과 반환해서 CreateRoom
+			// 알파벳상 큰 쪽 = 빈 결과 반환해서 상대가 CreateRoom 할 때까지 대기
+			if my_npid > *opp_npid {
+				// 나는 "나중에 JoinRoom 할 쪽" = 빈 결과 반환해서 계속 SearchRoom 폴링하게
+				info!("Rematch waiting: {} waiting for {}'s room", my_npid, opp_npid);
+				let resp = SearchRoomResponse {
+					start_index: 1,
+					total: 0,
+					rooms: vec![],
+				};
+				Client::add_data_packet(reply, &resp.encode_to_vec());
+				return Ok(ErrorType::NoError);
+			}
+			// 내가 "먼저 CreateRoom 할 쪽"이면 평소대로 진행 → 빈 결과 받으면 게임이 CreateRoom
 		}
 
 		let resp = self.shared.room_manager.read().search_room(&com_id, &search_req)?;
