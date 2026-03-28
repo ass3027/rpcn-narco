@@ -174,6 +174,7 @@ pub struct SharedData {
 	score_cache: Arc<ScoresCache>,
 	game_tracker: Arc<GameTracker>,
 	cleanup_duty: Arc<RwLock<HashSet<i64>>>,
+	pub rematch_pairs: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
 }
 
 #[derive(Clone)]
@@ -348,6 +349,7 @@ impl SharedData {
 			score_cache,
 			game_tracker,
 			cleanup_duty,
+			rematch_pairs: Arc::new(RwLock::new(HashMap::new())),
 		}
 	}
 }

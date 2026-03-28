@@ -92,7 +92,7 @@ impl Client {
 	}
 
 	pub async fn leave_room(&self, com_id: &ComId, room_id: u64, opt_data: Option<&PresenceOptionData>, event_cause: EventCause) -> ErrorType {
-		let (destroyed, users, user_data);
+		let (destroyed, users, user_data, opponent_npid);
 		{
 			let mut room_manager = self.shared.room_manager.write();
 			if !room_manager.room_exists(com_id, room_id) {
@@ -113,9 +113,21 @@ impl Client {
 			if let Err(e) = res {
 				return e;
 			}
-			let (destroyed_toa, users_toa) = res.unwrap();
+			let (destroyed_toa, users_toa, opponent_toa) = res.unwrap();
 			destroyed = destroyed_toa;
 			users = users_toa;
+			opponent_npid = opponent_toa;
+		}
+
+		// 만약 2인 방이었으면 rematch 페어에 선등록
+		if let Some(ref opp_npid) = opponent_npid {
+			let my_npid = self.client_info.npid.clone();
+			let opp_npid_clone = opp_npid.clone();
+			let mut pairs = self.shared.rematch_pairs.write();
+			// 양방향으로 저장 (서로가 서로를 찾을 수 있게끔)
+			pairs.insert(my_npid.clone(), (opp_npid_clone.clone(), std::time::Instant::now()));
+			pairs.insert(opp_npid_clone, (my_npid, std::time::Instant::now()));
+			info!("Rematch pair registered: {} <-> {}", self.client_info.npid, opp_npid);
 		}
 
 		if destroyed {
@@ -156,6 +168,52 @@ impl Client {
 
 	pub fn req_search_room(&mut self, data: &mut StreamExtractor, reply: &mut Vec<u8>) -> Result<ErrorType, ErrorType> {
 		let (com_id, search_req) = self.get_com_and_pb::<SearchRoomRequest>(data)?;
+
+		// rematch 페어 확인
+		let my_npid = &self.client_info.npid;
+		let opponent_npid = {
+			let mut pairs = self.shared.rematch_pairs.write();
+
+			// 30초 넘은 페어는 정리
+			pairs.retain(|_, (_, t)| t.elapsed().as_secs() < 30);
+
+			pairs.get(my_npid).map(|(opp, _)| opp.clone())
+		};
+
+		if let Some(ref opp_npid) = opponent_npid {
+			// 상대방이 이미 방을 만들었는지 확인
+			let room_manager = self.shared.room_manager.read();
+			let opponent_room = room_manager.get_rooms().values().find(|room| {
+				// 방에 상대방이 혼자 있는지 (아직 아무도 안 들어온 방)
+				room.users.len() == 1 && room.users.values().any(|u| u.npid == *opp_npid)
+			});
+
+			if let Some(room) = opponent_room {
+				// 상대 방을 SearchRoom 응답에 단독으로 담아서 반환
+				let mut inc_attrs: Vec<u16> = Vec::with_capacity(search_req.attr_id.len());
+				for a in &search_req.attr_id {
+					inc_attrs.push(a.get_verified()?);
+				}
+
+				let room_data = room.to_RoomDataExternal(search_req.option, &inc_attrs);
+
+				// 페어 삭제 (매칭 완료)
+				drop(room_manager);
+				let mut pairs = self.shared.rematch_pairs.write();
+				pairs.remove(my_npid);
+				pairs.remove(opp_npid);
+
+				info!("Rematch triggered: {} → {}'s room", my_npid, opp_npid);
+
+				let resp = SearchRoomResponse {
+					start_index: 1,
+					total: 1,
+					rooms: vec![room_data],
+				};
+				Client::add_data_packet(reply, &resp.encode_to_vec());
+				return Ok(ErrorType::NoError);
+			}
+		}
 
 		let resp = self.shared.room_manager.read().search_room(&com_id, &search_req)?;
 		Client::add_data_packet(reply, &resp);

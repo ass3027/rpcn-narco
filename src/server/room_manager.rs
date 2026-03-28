@@ -1511,11 +1511,21 @@ impl RoomManager {
 		))
 	}
 
-	pub fn leave_room(&mut self, com_id: &ComId, room_id: u64, user_id: i64) -> Result<(bool, HashSet<i64>), ErrorType> {
+	pub fn leave_room(&mut self, com_id: &ComId, room_id: u64, user_id: i64) -> Result<(bool, HashSet<i64>, Option<String>), ErrorType> {
 		if !self.room_exists(com_id, room_id) {
 			warn!("Attempted to leave a non existing room");
 			return Err(ErrorType::RoomMissing);
 		}
+
+		// 데스용 저장
+		let opponent_npid = {
+			let room = self.get_room(com_id, room_id);
+			if room.users.len() == 2 {
+				room.users.values().find(|u| u.user_id != user_id).map(|u| u.npid.clone())
+			} else {
+				None
+			}
+		};
 
 		if let Some(user_set) = self.user_rooms.get_mut(&user_id) {
 			if user_set.get(&(*com_id, room_id)).is_none() {
@@ -1591,13 +1601,13 @@ impl RoomManager {
 				}
 				// Remove from global room list
 				self.rooms.remove(&(*com_id, room_id));
-				return Ok((true, user_list));
+				return Ok((true, user_list, opponent_npid));
 			}
 		}
 
 		// TODO: signaling if room is in star signaling mode!
 
-		Ok((false, user_list))
+		Ok((false, user_list, opponent_npid))
 	}
 
 	pub fn search_room(&self, com_id: &ComId, req: &SearchRoomRequest) -> Result<Vec<u8>, ErrorType> {
