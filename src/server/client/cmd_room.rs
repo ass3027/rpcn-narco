@@ -98,6 +98,10 @@ impl Client {
 				let room = room_manager.get_room(com_id, room_id);
 				if room.users.len() == 2 {
 					room.users.values().find(|u| u.user_id != self.client_info.user_id).map(|u| u.npid.clone())
+				} else if room.users.len() == 1 {
+					// 내가 나중에 나가는 쪽 → 이미 등록된 페어에서 상대 찾기
+					let pairs = self.shared.rematch_pairs.read();
+					pairs.get(&self.client_info.npid).map(|(opp, _)| opp.clone())
 				} else {
 					None
 				}
@@ -119,7 +123,6 @@ impl Client {
 				return e;
 			}
 
-			// We get this in advance in case the room is not destroyed
 			let wip_user_data = room.get_room_member_update_info(member_id.unwrap(), event_cause.clone(), opt_data);
 			user_data = wip_user_data.encode_to_vec();
 
@@ -127,13 +130,13 @@ impl Client {
 			if let Err(e) = res {
 				return e;
 			}
+			// ★ 여기가 핵심 수정: (bool, HashSet) 두 개만 받기
 			let (destroyed_toa, users_toa) = res.unwrap();
 			destroyed = destroyed_toa;
 			users = users_toa;
-			opponent_npid = opponent_toa;
 		}
 
-		// 만약 2인 방이었으면 rematch 페어에 선등록
+		// ★ 페어 등록
 		if let Some(ref opp_npid) = opponent_npid {
 			let my_npid = self.client_info.npid.clone();
 			let opp_npid_clone = opp_npid.clone();
@@ -144,7 +147,6 @@ impl Client {
 		}
 
 		if destroyed {
-			// Notify other room users that the room has been destroyed
 			let room_update = RoomUpdateInfo {
 				event_cause: Uint8::new_from_value(event_cause as u8),
 				error_code: 0,
@@ -159,7 +161,6 @@ impl Client {
 			let notif = Client::create_notification(NotificationType::RoomDestroyed, &n_msg);
 			self.send_notification(&notif, &users).await;
 		} else {
-			// Notify other room users that someone left the room
 			let mut n_msg: Vec<u8> = Vec::new();
 			n_msg.extend(&room_id.to_le_bytes());
 			Client::add_data_packet(&mut n_msg, &user_data);

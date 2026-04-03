@@ -273,7 +273,7 @@ impl SignalParam {
 }
 
 pub(crate) struct RoomUser {
-	user_id: i64,
+	pub(crate) user_id: i64,
 	pub(crate) npid: String,
 	pub(crate) online_name: String,
 	avatar_url: String,
@@ -1517,16 +1517,6 @@ impl RoomManager {
 			return Err(ErrorType::RoomMissing);
 		}
 
-		// 데스용 저장
-		let opponent_npid = {
-			let room = self.get_room(com_id, room_id);
-			if room.users.len() == 2 {
-				room.users.values().find(|u| u.user_id != user_id).map(|u| u.npid.clone())
-			} else {
-				None
-			}
-		};
-
 		if let Some(user_set) = self.user_rooms.get_mut(&user_id) {
 			if user_set.get(&(*com_id, room_id)).is_none() {
 				warn!("Couldn't find the room in the user user_rooms set");
@@ -1540,12 +1530,11 @@ impl RoomManager {
 
 		let room = self.get_mut_room(com_id, room_id);
 		let member_id = room.find_user(user_id);
-		assert!(member_id != 0); // This should never happen as it would mean user_rooms is incoherent
+		assert!(member_id != 0);
 
 		let member = room.users.remove(&member_id).unwrap();
 		if member.group_id != 0 {
 			let group = &mut room.group_config[(member.group_id - 1) as usize];
-
 			group.num_members -= 1;
 			if group.num_members == 0 && !group.fixed_label {
 				group.label = None;
@@ -1554,19 +1543,15 @@ impl RoomManager {
 
 		room.free_slot(member_id).unwrap();
 
-		// Remove full flag if necessary
 		if room.users.len() != room.max_slot as usize {
 			room.flag_attr &= !(SceNpMatching2FlagAttr::SCE_NP_MATCHING2_ROOM_FLAG_ATTR_FULL as u32);
 		}
 
-		// Generate list of users left
 		let user_list: HashSet<i64> = room.users.iter().map(|user| user.1.user_id).collect();
 
 		if member_id == room.owner {
-			// Check if the room is getting destroyed
 			let mut found_successor = false;
 
-			// Try to find successor in the designated successor list
 			while let Some(s) = room.owner_succession.pop_front() {
 				if room.users.contains_key(&s) {
 					found_successor = true;
@@ -1576,7 +1561,6 @@ impl RoomManager {
 				}
 			}
 
-			// If no successor is found and there are still users, assign ownership randomly
 			if !found_successor && !room.users.is_empty() {
 				let random_user = rand::thread_rng().gen_range(0..room.users.len());
 				room.owner = *room.users.keys().nth(random_user).unwrap();
@@ -1585,11 +1569,9 @@ impl RoomManager {
 			}
 
 			if !found_successor {
-				// Remove the room from appropriate list
 				let lobby_id = room.lobby_id;
 				let world_id = room.world_id;
 
-				// Remove users from user_rooms
 				for user_id in &user_list {
 					self.user_rooms.get_mut(user_id).unwrap().remove(&(*com_id, room_id));
 				}
@@ -1599,15 +1581,13 @@ impl RoomManager {
 				} else {
 					self.lobby_rooms.get_mut(&(*com_id, lobby_id)).unwrap().remove(&room_id);
 				}
-				// Remove from global room list
+
 				self.rooms.remove(&(*com_id, room_id));
-				return Ok((true, user_list, opponent_npid));
+				return Ok((true, user_list)); // ← opponent_npid 제거
 			}
 		}
 
-		// TODO: signaling if room is in star signaling mode!
-
-		Ok((false, user_list, opponent_npid))
+		Ok((false, user_list)) // ← opponent_npid 제거
 	}
 
 	pub fn search_room(&self, com_id: &ComId, req: &SearchRoomRequest) -> Result<Vec<u8>, ErrorType> {
