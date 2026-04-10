@@ -1,6 +1,5 @@
 volumes:
-  rpcnstorage:
-    name: rpcnstorage
+  rpcn-storage:
     driver: local
     driver_opts:
       # Use your preferred storage path here, it must already exist
@@ -10,11 +9,14 @@ volumes:
 
 services:
   rpcn:
-    container_name: rpcn
+    image: crecent/rpcn-loopy
     build:
       context: .
       dockerfile: Dockerfile
     volumes:
-      - rpcnstorage:/rpcn
+      - rpcn-storage
     # Only works on Linux currently
     network_mode: host
+#    ports:
+#      - "31313:31313"
+#      - "3657:3657"
