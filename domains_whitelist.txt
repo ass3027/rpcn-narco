@@ -2,3 +2,4 @@ naver.com
 nate.com
 daum.net
 kakao.com
+co.jp
