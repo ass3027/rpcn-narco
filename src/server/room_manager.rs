@@ -10,7 +10,6 @@ use prost::Message;
 use rand::Rng;
 use tracing::{info, warn};
 
-use crate::server::client::com_id_to_string;
 use crate::server::client::{Client, ClientInfo, ComId, ErrorType, EventCause};
 use crate::server::stream_extractor::np2_structs::*;
 use crate::server::stream_extractor::protobuf_helpers::{ProtobufMaker, ProtobufVerifier};
