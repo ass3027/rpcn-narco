@@ -35,6 +35,7 @@ pub struct Config {
 	stat_server_host_and_port: Option<(String, String)>,
 	stat_server_path: String,
 	stat_server_cache_life: u32,
+	external_user_api_key: String,
 	admins_list: Vec<String>,
 }
 
@@ -53,6 +54,7 @@ impl Config {
 			stat_server_host_and_port: None,
 			stat_server_path: "rpcn_stats".to_string(),
 			stat_server_cache_life: 0,
+			external_user_api_key: String::new(),
 			admins_list: Vec::new(),
 		}
 	}
@@ -192,6 +194,7 @@ impl Config {
 
 			set_string("StatServerPath", &mut self.stat_server_path);
 			set_u32("StatServerCacheLife", &mut self.stat_server_cache_life);
+			set_string("ExternalUserApiKey", &mut self.external_user_api_key);
 
 			if stat_server_host.is_empty() || stat_server_port.is_empty() {
 				println!("Stat server is enabled but it's missing host/port information, disabling it!");
@@ -283,6 +286,10 @@ impl Config {
 
 	pub fn get_stat_server_path(&self) -> &str {
 		&self.stat_server_path
+	}
+
+	pub fn get_external_user_api_key(&self) -> &str {
+		&self.external_user_api_key
 	}
 
 	pub fn get_admins_list(&self) -> &Vec<String> {

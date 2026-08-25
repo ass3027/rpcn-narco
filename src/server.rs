@@ -187,7 +187,8 @@ impl Server {
 			install_signal_handlers(&term_watch);
 
 			self.start_udp_server(term_watch.clone()).await?;
-			self.start_stat_server(term_watch.clone(), self.game_tracker.clone(), self.room_manager.clone()).await?;
+			self.start_stat_server(term_watch.clone(), self.game_tracker.clone(), self.room_manager.clone(), self.db_pool.clone())
+				.await?;
 			self.start_cleaner_task(term_watch.clone(), self.db_pool.clone(), self.client_infos.clone()).await;
 
 			let listener = TcpListener::bind(&addr).await.map_err(|e| io::Error::new(e.kind(), format!("Error binding to <{}>: {}", &addr, e)))?;

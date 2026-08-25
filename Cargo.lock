@@ -498,6 +498,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-body-util"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23169fe34a5fbcdd3f3862e78fb9b6fccd5f02a6dc6f732547005d45631ce71c"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1267,6 +1280,7 @@ dependencies = [
 name = "rpcn"
 version = "1.8.5"
 dependencies = [
+ "http-body-util",
  "hyper",
  "hyper-util",
  "lettre",
@@ -1284,6 +1298,8 @@ dependencies = [
  "rusqlite",
  "rust-argon2",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "socket2 0.5.10",
  "tokio",
  "tokio-rustls",
@@ -1440,6 +1456,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

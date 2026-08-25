@@ -50,6 +50,7 @@ impl std::fmt::Display for DbError {
 #[allow(dead_code)]
 pub struct UserQueryResult {
 	pub user_id: i64,
+	pub username: String,
 	hash: Vec<u8>,
 	salt: Vec<u8>,
 	pub online_name: String,
@@ -964,21 +965,22 @@ impl Database {
 
 	pub fn check_user(&self, username: &str, password: &str, token: &str, check_token: bool) -> Result<UserQueryResult, DbError> {
 		let res: rusqlite::Result<UserQueryResult> = self.conn.query_row(
-			"SELECT user_id, hash, salt, online_name, avatar_url, email, email_check, token, admin, stat_agent, banned FROM account WHERE username = ?1",
+			"SELECT user_id, username, hash, salt, online_name, avatar_url, email, email_check, token, admin, stat_agent, banned FROM account WHERE username = ?1",
 			rusqlite::params![username],
 			|r| {
 				Ok(UserQueryResult {
 					user_id: r.get(0).unwrap(),
-					hash: r.get(1).unwrap(),
-					salt: r.get(2).unwrap(),
-					online_name: r.get(3).unwrap(),
-					avatar_url: r.get(4).unwrap(),
-					email: r.get(5).unwrap(),
-					email_check: r.get(6).unwrap(),
-					token: r.get(7).unwrap(),
-					admin: r.get(8).unwrap(),
-					stat_agent: r.get(9).unwrap(),
-					banned: r.get(10).unwrap(),
+					username: r.get(1).unwrap(),
+					hash: r.get(2).unwrap(),
+					salt: r.get(3).unwrap(),
+					online_name: r.get(4).unwrap(),
+					avatar_url: r.get(5).unwrap(),
+					email: r.get(6).unwrap(),
+					email_check: r.get(7).unwrap(),
+					token: r.get(8).unwrap(),
+					admin: r.get(9).unwrap(),
+					stat_agent: r.get(10).unwrap(),
+					banned: r.get(11).unwrap(),
 				})
 			},
 		);
