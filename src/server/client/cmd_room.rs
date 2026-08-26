@@ -244,6 +244,8 @@ impl Client {
 			// 내가 "먼저 CreateRoom 할 쪽"이면 평소대로 진행 → 빈 결과 받으면 게임이 CreateRoom
 		}
 
+		let search_req = crate::server::game_specific_matchmaking::build_npwr02973_adjusted_request(&com_id, &search_req).unwrap_or(search_req);
+
 		let resp = self.shared.room_manager.read().search_room(&com_id, &search_req)?;
 		Client::add_data_packet(reply, &resp);
 		Ok(ErrorType::NoError)
