@@ -9,6 +9,7 @@
 # Other
 /.vscode/**
 /db/**
+/tus_data/**
 ticket_private.pem
 key.pem
 cert.pem
