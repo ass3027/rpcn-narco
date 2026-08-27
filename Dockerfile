@@ -9,7 +9,6 @@ RUN /usr/src/rpcn/target/release/rpcn --cert-gen
 FROM gcr.io/distroless/cc
 WORKDIR /rpcn
 COPY --from=builder /usr/src/rpcn/target/release/rpcn /usr/local/bin/rpcn
-COPY --from=builder /usr/src/rpcn/*.cfg ./
 COPY --from=builder /usr/src/rpcn/*.pem ./
 
 CMD ["rpcn"]

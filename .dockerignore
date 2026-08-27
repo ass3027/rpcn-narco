@@ -1,1 +1,8 @@
 target/
+*.cfg
+domains_whitelist.txt
+.env
+.git/
+ticket_private.pem
+key.pem
+cert.pem
