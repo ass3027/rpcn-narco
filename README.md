@@ -1,5 +1,38 @@
 # RPCN
 
+## Production deployment
+
+Production images are built by GitHub Actions and pushed to Amazon ECR when a
+`v*` tag is pushed. The production server keeps its active image version in
+an untracked `.env` file and starts the ECR image with `compose.prod.yml`.
+
+On the production server, create the deployment directory and data directory,
+then copy `.env.example` to `.env` and set its values. GitHub Actions uploads
+`compose.prod.yml` during each deployment, so the server does not need a Git
+clone or Git credentials. `IMAGE_TAG` is managed by the deployment workflow;
+do not use `latest`.
+
+Create these repository configuration values in GitHub:
+
+- Variables: `AWS_REGION`, `ECR_REPOSITORY`
+- Secrets: `AWS_ROLE_ARN`, `PROD_HOST`, `PROD_USER`,
+  `PROD_DEPLOY_PATH`, `PROD_SSH_PRIVATE_KEY`, `PROD_SSH_KNOWN_HOSTS`
+
+The AWS role must be trusted by this repository's GitHub Actions OIDC provider
+and allowed to push to the ECR repository. The production server needs Docker
+Compose, the AWS CLI, and an IAM role or credentials allowed to pull from that
+ECR repository. The workflow refreshes the ECR Docker login token before
+pulling the image. `PROD_SSH_KNOWN_HOSTS` must contain the server's pinned host key
+(for example, the output of `ssh-keyscan -H <server-ip>` obtained through a
+trusted channel).
+
+To roll back, set `IMAGE_TAG` in the server's `.env` to an earlier ECR image
+tag and run:
+
+```sh
+docker compose --env-file .env -f compose.prod.yml up -d --pull always
+```
+
 RPCN is a server that implements multiplayer functionality for RPCS3.  
 It implements rooms which permit matchmaking, scoreboards, title user storage(ie cloud saves), etc.  
 All the settings and their descriptions are in rpcn.cfg.

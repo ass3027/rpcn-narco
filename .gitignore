@@ -13,3 +13,4 @@
 ticket_private.pem
 key.pem
 cert.pem
+.env

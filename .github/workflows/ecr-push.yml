@@ -38,3 +38,54 @@ jobs:
             .
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+  deploy:
+    name: Deploy to production
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout deployment configuration
+        uses: actions/checkout@v6
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.PROD_SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload production Compose file
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          PROD_DEPLOY_PATH: ${{ secrets.PROD_DEPLOY_PATH }}
+        run: |
+          scp -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes compose.prod.yml \
+            "$PROD_USER@$PROD_HOST:$PROD_DEPLOY_PATH/compose.prod.yml"
+
+      - name: Pull and run production image
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          PROD_DEPLOY_PATH: ${{ secrets.PROD_DEPLOY_PATH }}
+          IMAGE_TAG: ${{ github.ref_name }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes "$PROD_USER@$PROD_HOST" \
+            "cd '$PROD_DEPLOY_PATH' && \
+             test -f .env && \
+             if grep -q '^IMAGE_TAG=' .env; then \
+               sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=$IMAGE_TAG/' .env; \
+             else \
+               printf '\\nIMAGE_TAG=%s\\n' '$IMAGE_TAG' >> .env; \
+             fi && \
+             ECR_REGISTRY=\$(sed -n 's/^ECR_REGISTRY=//p' .env) && \
+             aws ecr get-login-password --region '$AWS_REGION' | docker login --username AWS --password-stdin \"\$ECR_REGISTRY\" && \
+             docker compose --env-file .env -f compose.prod.yml pull && \
+             docker compose --env-file .env -f compose.prod.yml up -d --remove-orphans"

@@ -1,0 +1,16 @@
+volumes:
+  rpcn-storage:
+    driver: local
+    driver_opts:
+      # Must already exist on the production server.
+      device: ${RPCN_DATA_PATH}
+      o: bind
+      type: none
+
+services:
+  rpcn:
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG:?IMAGE_TAG must be set}
+    volumes:
+      - rpcn-storage:/rpcn
+    # Only works on Linux currently.
+    network_mode: host
