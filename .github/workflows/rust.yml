@@ -1,64 +1,29 @@
-name: Rust
+name: Rust tests
 
-on: [push]
+on:
+  workflow_call:
+  push:
+    branches:
+      - master
+  pull_request:
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  test:
+    name: Test
     runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v1
-    - uses: Swatinem/rust-cache@v2
-    - uses: arduino/setup-protoc@v3
-    - name: Build
-      run: cargo build --release --verbose
-    - name: Run tests
-      run: cargo test --release --verbose
-    - run: mkdir artifact
-    - run: cp target/release/rpcn artifact/rpcn
-    - run: cp rpcn.cfg artifact/rpcn.cfg
-    - run: cp servers.cfg artifact/servers.cfg
-    - run: cp server_redirs.cfg artifact/server_redirs.cfg
-    - run: cp scoreboards.cfg artifact/scoreboards.cfg
-    - name: Create artifact
-      run: cd artifact && tar -zcvf ../rpcn-linux.tar.gz ./ && cd ..
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4.0.0
-      with:
-        name: rpcn
-        path: rpcn-linux.tar.gz
-        compression-level: 9
-    - name: Release
-      uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        files: rpcn-linux.tar.gz
 
-  build-win:
-    runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v1
-    - uses: Swatinem/rust-cache@v2
-    - uses: arduino/setup-protoc@v3
-    - name: Build
-      run: cargo build --release --verbose
-    - name: Run tests
-      run: cargo test --release --verbose
-    - run: mkdir artifact-win
-    - run: copy target/release/rpcn.exe artifact-win/rpcn.exe
-    - run: copy rpcn.cfg artifact-win/rpcn.cfg
-    - run: copy servers.cfg artifact-win/servers.cfg
-    - run: copy server_redirs.cfg artifact-win/server_redirs.cfg
-    - run: copy scoreboards.cfg artifact-win/scoreboards.cfg
-    - name: Create artifact
-      run: Compress-Archive -Path artifact-win/* -Destination rpcn-win.zip
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4.0.0
-      with:
-        name: rpcn-win
-        path: rpcn-win.zip
-        compression-level: 9
-    - name: Release
-      uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        files: rpcn-win.zip
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+
+      - name: Run tests
+        run: cargo test --release --verbose
