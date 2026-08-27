@@ -80,6 +80,13 @@ jobs:
           ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes "$PROD_USER@$PROD_HOST" \
             "cd '$PROD_DEPLOY_PATH' && \
              test -f .env && \
+             RPCN_DATA_PATH=\$(sed -n 's/^RPCN_DATA_PATH=//p' .env) && \
+             test -n \"\$RPCN_DATA_PATH\" && \
+             test -f \"\$RPCN_DATA_PATH/rpcn.cfg\" && \
+             test -f \"\$RPCN_DATA_PATH/servers.cfg\" && \
+             test -f \"\$RPCN_DATA_PATH/server_redirs.cfg\" && \
+             test -f \"\$RPCN_DATA_PATH/scoreboards.cfg\" && \
+             test -f \"\$RPCN_DATA_PATH/domains_whitelist.txt\" && \
              if grep -q '^IMAGE_TAG=' .env; then \
                sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=$IMAGE_TAG/' .env; \
              else \

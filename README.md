@@ -12,6 +12,12 @@ then copy `.env.example` to `.env` and set its values. GitHub Actions uploads
 clone or Git credentials. `IMAGE_TAG` is managed by the deployment workflow;
 do not use `latest`.
 
+Runtime configuration must not be built into the image. Keep `rpcn.cfg`,
+`servers.cfg`, `server_redirs.cfg`, `scoreboards.cfg`, and
+`domains_whitelist.txt` in `RPCN_DATA_PATH` on the production server. Create
+`rpcn.cfg` from `rpcn.cfg.example`. The deployment stops before restarting RPCN
+if any required runtime configuration file is missing.
+
 Create these repository configuration values in GitHub:
 
 - Variables: `AWS_REGION`, `ECR_REPOSITORY`
