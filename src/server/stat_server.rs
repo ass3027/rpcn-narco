@@ -12,6 +12,7 @@ use crate::server::Server;
 use crate::server::client::{COMMUNICATION_ID_SIZE, ComId, TerminateWatch, com_id_to_string};
 use crate::server::database::db_score::DbBoardInfo;
 use crate::server::database::{Database, DbError, DbMatchRecord};
+use crate::server::game_specific_tus;
 use crate::server::room_manager::RoomManager;
 use crate::server::score_cache::{GetScoreResultCache, ScoresCache};
 use http_body_util::{BodyExt, Limited};
@@ -44,6 +45,42 @@ struct ExternalUserVerifyResponse {
 	avatar_url: String,
 	admin: bool,
 	banned: bool,
+}
+
+#[derive(Deserialize)]
+struct AdminSetRankRequest {
+	npid: String,
+	com_id: String,
+	#[serde(default = "default_slot")]
+	slot: i32,
+	character: usize,
+	rank: u8,
+	rank_points: Option<u16>,
+	/// Write even while the account is connected. The client holds the save in
+	/// memory for the length of its session and writes it back on its next
+	/// save, so an edit made now is discarded; only set this for a session
+	/// known to be stale.
+	#[serde(default)]
+	force: bool,
+}
+
+fn default_slot() -> i32 {
+	1
+}
+
+#[derive(Serialize)]
+struct AdminCharacterRank {
+	rank: u8,
+	rank_points: u16,
+}
+
+#[derive(Serialize)]
+struct AdminSetRankResponse {
+	npid: String,
+	character: usize,
+	previous: AdminCharacterRank,
+	current: AdminCharacterRank,
+	data_id: u64,
 }
 
 struct CachedResponse {
@@ -333,6 +370,141 @@ impl StatServer {
 		Response::builder().status(status).header("Content-Type", "application/json").body(body).unwrap()
 	}
 
+	/// Sets one character's rank for an operator.
+	///
+	/// This writes a new save exactly the way the game does - a fresh data_id,
+	/// the slot repointed at it, a history row - rather than overwriting the
+	/// file in place, so nothing else has to know the edit happened.
+	async fn handle_admin_set_rank_req(
+		req: Request<hyper::body::Incoming>,
+		external_user_api_key: &str,
+		game_tracker: Arc<GameTracker>,
+		db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+	) -> Result<Response<String>, Infallible> {
+		if req.method() != Method::POST {
+			return Ok(StatServer::json_response(StatusCode::METHOD_NOT_ALLOWED, "{\"error\":\"method_not_allowed\"}".to_owned()));
+		}
+
+		let is_authorized = req
+			.headers()
+			.get("X-API-Key")
+			.and_then(|value| value.to_str().ok())
+			.is_some_and(|value| value.len() == external_user_api_key.len() && memcmp::eq(value.as_bytes(), external_user_api_key.as_bytes()));
+		if !is_authorized {
+			return Ok(StatServer::json_response(StatusCode::FORBIDDEN, "{\"error\":\"forbidden\"}".to_owned()));
+		}
+
+		let body = match Limited::new(req.into_body(), EXTERNAL_USER_API_MAX_BODY_SIZE).collect().await {
+			Ok(body) => body.to_bytes(),
+			Err(_) => return Ok(StatServer::json_response(StatusCode::BAD_REQUEST, "{\"error\":\"invalid_request\"}".to_owned())),
+		};
+		let request: AdminSetRankRequest = match serde_json::from_slice::<AdminSetRankRequest>(&body) {
+			Ok(request) if !request.npid.is_empty() && request.com_id.len() == COMMUNICATION_ID_SIZE => request,
+			_ => return Ok(StatServer::json_response(StatusCode::BAD_REQUEST, "{\"error\":\"invalid_request\"}".to_owned())),
+		};
+		if request.character >= game_specific_tus::CHARACTERS {
+			return Ok(StatServer::json_response(StatusCode::BAD_REQUEST, "{\"error\":\"no_such_character\"}".to_owned()));
+		}
+
+		let mut com_id: ComId = [0u8; COMMUNICATION_ID_SIZE];
+		com_id.copy_from_slice(request.com_id.as_bytes());
+
+		// Look the account up, and take the save the slot currently points at.
+		let lookup_pool = db_pool.clone();
+		let lookup_npid = request.npid.clone();
+		let lookup = tokio::task::spawn_blocking(move || {
+			let connection = lookup_pool.get().map_err(|_| DbError::Internal)?;
+			let db = Database::new(connection);
+			let user_id = db.get_user_id(&lookup_npid)?;
+			let online_name = db.get_online_name(user_id)?;
+			let (status, info) = db.tus_get_user_data(&com_id, user_id, request.slot)?;
+			Ok::<_, DbError>((user_id, online_name, status.data_id, info))
+		})
+		.await;
+
+		let (user_id, online_name, previous_data_id, info) = match lookup {
+			Ok(Ok(found)) => found,
+			Ok(Err(DbError::Empty)) => return Ok(StatServer::json_response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}".to_owned())),
+			_ => return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
+		};
+
+		if !request.force && StatServer::is_player_online(&game_tracker, &com_id, &online_name) {
+			return Ok(StatServer::json_response(StatusCode::CONFLICT, "{\"error\":\"player_online\"}".to_owned()));
+		}
+
+		let current = match Client::get_tus_data_file(previous_data_id).await {
+			Ok(data) => data,
+			Err(_) => return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"save_unreadable\"}".to_owned())),
+		};
+
+		let (edited, previous) = match game_specific_tus::set_character_rank(&com_id, &current, request.character, request.rank, request.rank_points) {
+			Ok(result) => result,
+			Err(game_specific_tus::EditError::UnsupportedTitle) => {
+				return Ok(StatServer::json_response(StatusCode::BAD_REQUEST, "{\"error\":\"unsupported_title\"}".to_owned()));
+			}
+			Err(game_specific_tus::EditError::NoSuchCharacter) => {
+				return Ok(StatServer::json_response(StatusCode::BAD_REQUEST, "{\"error\":\"no_such_character\"}".to_owned()));
+			}
+			Err(game_specific_tus::EditError::MalformedSave) => {
+				return Ok(StatServer::json_response(StatusCode::CONFLICT, "{\"error\":\"malformed_save\"}".to_owned()));
+			}
+		};
+
+		let data_id = Client::create_tus_data_file(&edited).await;
+		if data_id == 0 {
+			return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"save_not_written\"}".to_owned()));
+		}
+
+		let timestamp = Client::get_psn_timestamp();
+		let slot = request.slot;
+		let stored = tokio::task::spawn_blocking(move || {
+			let connection = db_pool.get().map_err(|_| DbError::Internal)?;
+			let db = Database::new(connection);
+			// The slot's info blob is carried over untouched; only the save
+			// behind it changed.
+			let info = if info.is_empty() { None } else { Some(info.as_slice()) };
+			db.tus_set_user_data(&com_id, user_id, slot, data_id, &info, user_id, timestamp, None, None)?;
+			if let Err(e) = db.tus_record_data_history(&com_id, user_id, slot, data_id, timestamp) {
+				warn!("Failed to record tus data history for operator edit {}: {:?}", data_id, e);
+			}
+			Ok::<_, DbError>(())
+		})
+		.await;
+
+		if !matches!(stored, Ok(Ok(()))) {
+			return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned()));
+		}
+
+		info!("Operator set {} character {} from rank {} to rank {}", request.npid, request.character, previous.rank, request.rank);
+
+		let response = AdminSetRankResponse {
+			npid: request.npid,
+			character: request.character,
+			previous: AdminCharacterRank {
+				rank: previous.rank,
+				rank_points: previous.rank_points,
+			},
+			current: AdminCharacterRank {
+				rank: request.rank,
+				rank_points: request.rank_points.unwrap_or_else(|| {
+					game_specific_tus::read_character_ranks(&com_id, &edited)
+						.ok()
+						.and_then(|ranks| ranks.get(request.character).map(|c| c.rank_points))
+						.unwrap_or(0)
+				}),
+			},
+			data_id,
+		};
+		match serde_json::to_string(&response) {
+			Ok(json) => Ok(Response::builder().header("Content-Type", "application/json").body(json).unwrap()),
+			Err(_) => Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
+		}
+	}
+
+	fn is_player_online(game_tracker: &Arc<GameTracker>, com_id: &ComId, online_name: &str) -> bool {
+		game_tracker.psn_games.read().get(com_id).is_some_and(|game| game.players.read().contains_key(online_name))
+	}
+
 	async fn handle_external_user_verify_req(
 		req: Request<hyper::body::Incoming>,
 		external_user_api_key: &str,
@@ -399,6 +571,14 @@ impl StatServer {
 		if req_path == external_user_verify_path {
 			if let Some(external_user_api_key) = external_user_api_key {
 				return StatServer::handle_external_user_verify_req(req, &external_user_api_key, db_pool).await;
+			}
+			return Ok(Response::builder().status(StatusCode::NOT_FOUND).body("".to_owned()).unwrap());
+		}
+
+		let admin_set_rank_path = format!("{}/admin/character-rank", path);
+		if req_path == admin_set_rank_path {
+			if let Some(external_user_api_key) = external_user_api_key {
+				return StatServer::handle_admin_set_rank_req(req, &external_user_api_key, game_tracker, db_pool).await;
 			}
 			return Ok(Response::builder().status(StatusCode::NOT_FOUND).body("".to_owned()).unwrap());
 		}

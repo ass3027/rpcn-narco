@@ -206,6 +206,86 @@ pub(crate) fn apply_rank_floor(com_id: &ComId, data: &[u8], previous: Option<&[u
 	Some(out)
 }
 
+/// What one character of a save looked like before or after an edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CharacterRank {
+	pub character: usize,
+	pub rank: u8,
+	pub rank_points: u16,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum EditError {
+	/// The title does not store its ranks in a layout this knows about.
+	UnsupportedTitle,
+	/// Not a well formed save: wrong size, or the checksum does not verify.
+	MalformedSave,
+	/// There is no character with that id.
+	NoSuchCharacter,
+}
+
+/// Number of characters a save has room for, so a caller can report the
+/// accepted range without knowing the layout.
+pub const CHARACTERS: usize = CHAR_COUNT;
+
+/// Sets one character's rank, for an operator correcting a record.
+///
+/// Unlike the floor, this will lower a rank as well as raise it: the point of
+/// it is to put a value back where it belongs. `rank_points` defaults to the
+/// bottom of the new rank when not given.
+///
+/// Returns the rewritten save together with the character as it was, so the
+/// caller can report what it replaced.
+pub fn set_character_rank(com_id: &ComId, data: &[u8], character: usize, rank: u8, rank_points: Option<u16>) -> Result<(Vec<u8>, CharacterRank), EditError> {
+	if com_id != &NPWR02973_00 {
+		return Err(EditError::UnsupportedTitle);
+	}
+	if character >= CHAR_COUNT {
+		return Err(EditError::NoSuchCharacter);
+	}
+	if data.len() != RECORD_SIZE || checksum(data) != stored_checksum(data) {
+		return Err(EditError::MalformedSave);
+	}
+
+	let base = CHAR_BASE + character * CHAR_STRIDE;
+	let previous = CharacterRank {
+		character,
+		rank: data[base + CHAR_RANK],
+		rank_points: u16::from_be_bytes([data[base + CHAR_RANK_POINTS], data[base + CHAR_RANK_POINTS + 1]]),
+	};
+
+	let mut out = data.to_vec();
+	out[base + CHAR_RANK] = rank;
+	let points = rank_points.unwrap_or_else(|| rank_points_for(rank)).to_be_bytes();
+	out[base + CHAR_RANK_POINTS..base + CHAR_RANK_POINTS + 2].copy_from_slice(&points);
+
+	let resealed = checksum(&out).to_be_bytes();
+	out[0..4].copy_from_slice(&resealed);
+
+	Ok((out, previous))
+}
+
+/// Reads one character out of a save, so an operator can look before editing.
+pub fn read_character_ranks(com_id: &ComId, data: &[u8]) -> Result<Vec<CharacterRank>, EditError> {
+	if com_id != &NPWR02973_00 {
+		return Err(EditError::UnsupportedTitle);
+	}
+	if data.len() != RECORD_SIZE || checksum(data) != stored_checksum(data) {
+		return Err(EditError::MalformedSave);
+	}
+
+	Ok((0..CHAR_COUNT)
+		.map(|character| {
+			let base = CHAR_BASE + character * CHAR_STRIDE;
+			CharacterRank {
+				character,
+				rank: data[base + CHAR_RANK],
+				rank_points: u16::from_be_bytes([data[base + CHAR_RANK_POINTS], data[base + CHAR_RANK_POINTS + 1]]),
+			}
+		})
+		.collect())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -373,6 +453,51 @@ mod tests {
 		assert_eq!(rank_of(&out, 3), 26, "a rank above the floor is left alone");
 		assert_eq!(points_of(&out, 3), 1234);
 		assert_eq!(rank_of(&out, 1), 21);
+	}
+
+	#[test]
+	fn an_operator_can_set_one_character_rank() {
+		let record = make_record(10);
+		let (out, previous) = set_character_rank(&NPWR02973_00, &record, 14, 25, None).expect("the edit applies");
+		assert_eq!(previous.character, 14);
+		assert_eq!(previous.rank, 10, "the caller is told what it replaced");
+		assert_eq!(rank_of(&out, 14), 25);
+		assert_eq!(points_of(&out, 14), rank_points_for(25), "points default to the bottom of the new rank");
+		assert_eq!(rank_of(&out, 13), 10, "no other character is touched");
+		assert_eq!(checksum(&out), stored_checksum(&out), "the edited save reseals");
+	}
+
+	#[test]
+	fn an_operator_can_lower_a_rank_and_choose_the_points() {
+		let record = make_record(25);
+		let (out, previous) = set_character_rank(&NPWR02973_00, &record, 0, 13, Some(4321)).expect("the edit applies");
+		assert_eq!(previous.rank, 25);
+		assert_eq!(rank_of(&out, 0), 13, "lowering is allowed, unlike the floor");
+		assert_eq!(points_of(&out, 0), 4321);
+	}
+
+	#[test]
+	fn an_edit_is_refused_for_an_unknown_character_or_an_unusable_save() {
+		let record = make_record(10);
+		assert_eq!(set_character_rank(&NPWR02973_00, &record, CHARACTERS, 25, None).unwrap_err(), EditError::NoSuchCharacter);
+		assert_eq!(set_character_rank(b"NPWR00482_00", &record, 0, 25, None).unwrap_err(), EditError::UnsupportedTitle);
+
+		let mut corrupt = record.clone();
+		corrupt[0] ^= 0xFF;
+		assert_eq!(set_character_rank(&NPWR02973_00, &corrupt, 0, 25, None).unwrap_err(), EditError::MalformedSave);
+	}
+
+	#[test]
+	fn reading_ranks_reports_every_character() {
+		let mut record = make_record(10);
+		record[CHAR_BASE + 7 * CHAR_STRIDE + CHAR_RANK] = 29;
+		reseal(&mut record);
+
+		let ranks = read_character_ranks(&NPWR02973_00, &record).expect("a well formed save reads");
+		assert_eq!(ranks.len(), CHARACTERS);
+		assert_eq!(ranks[7].rank, 29);
+		assert_eq!(ranks[0].rank, 10);
+		assert!(ranks.iter().enumerate().all(|(i, c)| c.character == i));
 	}
 
 	#[test]

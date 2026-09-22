@@ -79,7 +79,7 @@ impl Client {
 		format!("{}/{:020}.{}", TUS_DATA_DIRECTORY, id, TUS_FILE_EXTENSION)
 	}
 
-	async fn create_tus_data_file(data: &[u8]) -> u64 {
+	pub(crate) async fn create_tus_data_file(data: &[u8]) -> u64 {
 		let id = TUS_DATA_ID_DISPENSER.fetch_add(1, Ordering::SeqCst);
 		let path = Client::tus_id_to_path(id);
 
@@ -98,7 +98,7 @@ impl Client {
 		id
 	}
 
-	async fn get_tus_data_file(id: u64) -> Result<Vec<u8>, ErrorType> {
+	pub(crate) async fn get_tus_data_file(id: u64) -> Result<Vec<u8>, ErrorType> {
 		let path = Client::tus_id_to_path(id);
 
 		fs::read(&path).await.map_err(|e| {

@@ -1173,6 +1173,20 @@ impl Database {
 		Ok(res.unwrap())
 	}
 
+	/// The name the account plays under, which is what the game tracker keys
+	/// its list of connected players by.
+	pub fn get_online_name(&self, user_id: i64) -> Result<String, DbError> {
+		self.conn
+			.query_row("SELECT online_name FROM account WHERE user_id = ?1", rusqlite::params![user_id], |r| r.get(0))
+			.map_err(|e| match e {
+				rusqlite::Error::QueryReturnedNoRows => DbError::Empty,
+				e => {
+					error!("Unexpected error querying online_name: {}", e);
+					DbError::Internal
+				}
+			})
+	}
+
 	pub fn get_username(&self, user_id: i64) -> Result<String, DbError> {
 		let res: rusqlite::Result<String> = self
 			.conn
