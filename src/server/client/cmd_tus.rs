@@ -704,15 +704,17 @@ impl Client {
 				return ret_value;
 			}
 
-			// Some titles need a brand new account placed at a starting rank.
-			// This is only applied to the very first save of a slot: a player
-			// who has since been demoted must not be silently pushed back up.
-			let starting_rank_data = match db.tus_get_user_data_timestamp_and_author(&com_id, user_id, slot) {
-				Ok(None) => game_specific_tus::apply_starting_rank(&com_id, &tus_req.data),
-				Ok(Some(_)) => None,
+			// Some titles place a new account at a starting rank, and raise the
+			// rest of the roster when the account climbs into a new tier. Both
+			// need the save this one replaces to tell those apart, so read it
+			// back; there is no previous save for an account's first one.
+			let previous_save = match db.tus_get_user_data(&com_id, user_id, slot) {
+				Ok((status, _)) => Client::get_tus_data_file(status.data_id).await.ok(),
+				Err(DbError::Empty) => None,
 				Err(_) => return Err(ErrorType::DbFail),
 			};
-			let data_to_store: &[u8] = starting_rank_data.as_deref().unwrap_or(&tus_req.data);
+			let floored_data = game_specific_tus::apply_rank_floor(&com_id, &tus_req.data, previous_save.as_deref());
+			let data_to_store: &[u8] = floored_data.as_deref().unwrap_or(&tus_req.data);
 
 			let data_id = Client::create_tus_data_file(data_to_store).await;
 
