@@ -39,6 +39,10 @@ const CHAR_COUNT: usize = 59;
 const CHAR_RANK: usize = 0x00;
 const CHAR_RANK_POINTS: usize = 0x02;
 
+/// The account level rank, which is a high water mark rather than a current
+/// standing: it is never seen to go down.
+const ACCOUNT_RANK: usize = 0x18;
+
 /// Rank a fresh account starts every character at. 1st Dan.
 const STARTING_RANK: u8 = 10;
 /// Rank progress that goes with it. Observed resting value for this rank.
@@ -100,11 +104,30 @@ fn floor_for(best_rank: u8) -> u8 {
 	}
 }
 
+/// The best rank the account has ever held.
+///
+/// Not the same as its best character's rank right now. A character is demoted
+/// when it loses, but the account level rank at `ACCOUNT_RANK` only ever goes
+/// up - across the whole population it is above the best character in 132
+/// accounts out of 544 and below it in none - so it is the account's high
+/// water mark and the characters are where it stands today.
+///
+/// The floor is what the player has earned, so it follows the high water mark.
+/// Reading only the characters would drop the floor for exactly the players
+/// who have the longest history: among the 30 accounts with the most matches
+/// played, 10 have a high water mark above their best character, by 3 to 8
+/// ranks.
 fn best_rank(record: &[u8]) -> u8 {
-	(0..CHAR_COUNT).map(|i| record[CHAR_BASE + i * CHAR_STRIDE + CHAR_RANK]).max().unwrap_or(0)
+	let best_character = (0..CHAR_COUNT).map(|i| record[CHAR_BASE + i * CHAR_STRIDE + CHAR_RANK]).max().unwrap_or(0);
+	best_character.max(record[ACCOUNT_RANK])
 }
 
 /// Raises every character below `floor`, returning how many were raised.
+///
+/// The account level rank comes along when it sits below the floor, which
+/// happens where the floor is the starting rank and the account never reached
+/// it. Leaving it behind would show the account ranked under every one of its
+/// own characters. It only ever goes up here, as in the game.
 fn raise_to(record: &mut [u8], floor: u8) -> usize {
 	let points = rank_points_for(floor).to_be_bytes();
 	let mut raised = 0;
@@ -116,6 +139,9 @@ fn raise_to(record: &mut [u8], floor: u8) -> usize {
 		record[base + CHAR_RANK] = floor;
 		record[base + CHAR_RANK_POINTS..base + CHAR_RANK_POINTS + 2].copy_from_slice(&points);
 		raised += 1;
+	}
+	if record[ACCOUNT_RANK] < floor {
+		record[ACCOUNT_RANK] = floor;
 	}
 	raised
 }
@@ -348,11 +374,29 @@ mod tests {
 	use super::*;
 
 	/// Builds a save whose checksum verifies, with every character at `rank`.
+	/// A save whose whole roster sits at `rank`, with the account's high water
+	/// mark at the same place, which is how a save that never demoted looks.
 	fn make_record(rank: u8) -> Vec<u8> {
+		make_record_with_account(rank, rank)
+	}
+
+	/// A save whose roster sits at `rank` while the account once reached
+	/// `account_rank`, which is how a save looks after its characters demoted.
+	fn make_record_with_account(rank: u8, account_rank: u8) -> Vec<u8> {
 		let mut record = vec![0u8; RECORD_SIZE];
 		for i in 0..CHAR_COUNT {
 			record[CHAR_BASE + i * CHAR_STRIDE + CHAR_RANK] = rank;
 		}
+		record[ACCOUNT_RANK] = account_rank;
+		reseal(&mut record);
+		record
+	}
+
+	/// A save with one character the player climbed with and a roster sitting
+	/// well below it, which is the shape the floor exists for.
+	fn make_record_with_one_climber(climber: u8, rest: u8, account_rank: u8) -> Vec<u8> {
+		let mut record = make_record_with_account(rest, account_rank);
+		record[CHAR_BASE + CHAR_RANK] = climber;
 		reseal(&mut record);
 		record
 	}
@@ -614,6 +658,38 @@ mod tests {
 		reseal(&mut record);
 		assert_eq!(account_record(&NPWR02973_00, &record), Some((300, 7)));
 		assert_eq!(account_record(b"NPWR00482_00", &record), None);
+	}
+
+	#[test]
+	fn the_floor_follows_what_the_account_once_reached() {
+		// A player who climbed to 29 and whose characters have since fallen to
+		// 22 is entitled to the floor for 29, not the one for 22. This is the
+		// case for a third of the accounts with the most matches played.
+		let previous = make_record_with_one_climber(22, 10, 28);
+		let current = make_record_with_one_climber(22, 10, 29);
+
+		let raised = apply_rank_floor(&NPWR02973_00, &current, Some(&previous)).expect("crossing 29 raises the roster");
+		assert_eq!(rank_of(&raised, 1), 21, "floor for 29 is 21, not the 13 that reading only the characters would give");
+		assert_eq!(rank_of(&raised, 0), 22, "the character the player climbed with is untouched");
+	}
+
+	#[test]
+	fn the_account_rank_comes_up_with_the_roster() {
+		// Below 1st Dan the whole roster is raised to it. Leaving the account
+		// behind would rank it under every one of its own characters.
+		let record = make_record_with_account(3, 3);
+		let raised = apply_rank_floor(&NPWR02973_00, &record, None).expect("a first save is brought up to the starting rank");
+
+		assert_eq!(rank_of(&raised, 0), STARTING_RANK);
+		assert_eq!(raised[ACCOUNT_RANK], STARTING_RANK);
+	}
+
+	#[test]
+	fn an_account_rank_above_the_floor_is_left_alone() {
+		let previous = make_record_with_one_climber(22, 10, 28);
+		let current = make_record_with_one_climber(22, 10, 29);
+		let raised = apply_rank_floor(&NPWR02973_00, &current, Some(&previous)).unwrap();
+		assert_eq!(raised[ACCOUNT_RANK], 29, "the high water mark is never pulled down to the floor");
 	}
 
 	#[test]
