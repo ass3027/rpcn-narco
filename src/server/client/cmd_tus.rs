@@ -704,11 +704,28 @@ impl Client {
 				return ret_value;
 			}
 
-			let data_id = Client::create_tus_data_file(&tus_req.data).await;
+			// Some titles need a brand new account placed at a starting rank.
+			// This is only applied to the very first save of a slot: a player
+			// who has since been demoted must not be silently pushed back up.
+			let starting_rank_data = match db.tus_get_user_data_timestamp_and_author(&com_id, user_id, slot) {
+				Ok(None) => game_specific_tus::apply_starting_rank(&com_id, &tus_req.data),
+				Ok(Some(_)) => None,
+				Err(_) => return Err(ErrorType::DbFail),
+			};
+			let data_to_store: &[u8] = starting_rank_data.as_deref().unwrap_or(&tus_req.data);
+
+			let data_id = Client::create_tus_data_file(data_to_store).await;
 
 			let res = db.tus_set_user_data(&com_id, user_id, slot, data_id, &info, user_id, new_timestamp, compare_timestamp, compare_author_id);
 			match res {
-				Ok(()) => Ok(ErrorType::NoError),
+				Ok(()) => {
+					// Best effort: the save itself already succeeded, so a
+					// failure to record the history must not fail the request.
+					if let Err(e) = db.tus_record_data_history(&com_id, user_id, slot, data_id, new_timestamp) {
+						warn!("Failed to record tus data history for data_id {}: {:?}", data_id, e);
+					}
+					Ok(ErrorType::NoError)
+				}
 				Err(DbError::Empty) => {
 					Client::delete_tus_data(data_id).await;
 					Ok(ErrorType::CondFail)
