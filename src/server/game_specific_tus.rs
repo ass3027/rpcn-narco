@@ -153,7 +153,8 @@ fn best_rank(record: &[u8]) -> u8 {
 	best_character.max(record[ACCOUNT_RANK])
 }
 
-/// Raises every character below `floor`, returning how many were raised.
+/// Raises every character below `floor`, returning how many values were
+/// raised - characters and, where it applies, the account level rank.
 ///
 /// The account level rank comes along when it sits below the floor, which
 /// happens where the floor is the starting rank and the account never reached
@@ -171,8 +172,11 @@ fn raise_to(record: &mut [u8], floor: u8) -> usize {
 		record[base + CHAR_RANK_POINTS..base + CHAR_RANK_POINTS + 2].copy_from_slice(&points);
 		raised += 1;
 	}
+	// Counted with the characters, because the caller keeps the rewritten save
+	// only when something was raised and this is a change like any other.
 	if record[ACCOUNT_RANK] < floor {
 		record[ACCOUNT_RANK] = floor;
+		raised += 1;
 	}
 	raised
 }

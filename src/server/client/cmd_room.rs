@@ -92,17 +92,15 @@ impl Client {
 	}
 
 	pub async fn leave_room(&self, com_id: &ComId, room_id: u64, opt_data: Option<&PresenceOptionData>, event_cause: EventCause) -> ErrorType {
-		// Set only when the room still has both players, so a match is recorded
-		// once: by whoever leaves first.
+		// Set only when the room still has both players, under the write lock
+		// below, so a match is recorded once: by whoever leaves first.
 		let mut finished_match_opponent_id: Option<i64> = None;
 		let opponent_npid = {
 			let room_manager = self.shared.room_manager.read();
 			if room_manager.room_exists(com_id, room_id) {
 				let room = room_manager.get_room(com_id, room_id);
 				if room.users.len() == 2 {
-					let opponent = room.users.values().find(|u| u.user_id != self.client_info.user_id);
-					finished_match_opponent_id = opponent.map(|u| u.user_id);
-					opponent.map(|u| u.npid.clone())
+					room.users.values().find(|u| u.user_id != self.client_info.user_id).map(|u| u.npid.clone())
 				} else if room.users.len() == 1 {
 					// 내가 나중에 나가는 쪽 → 이미 등록된 페어에서 상대 찾기
 					let pairs = self.shared.rematch_pairs.read();
@@ -123,6 +121,15 @@ impl Client {
 			}
 
 			let room = room_manager.get_room(com_id, room_id);
+
+			// Decided under the write lock that removes the user, so of two
+			// players leaving at the same moment - which is how a match ends -
+			// exactly one still sees a full room and the match is recorded
+			// once. Reading this under the shared lock above recorded it twice.
+			if room.users.len() == 2 {
+				finished_match_opponent_id = room.users.values().find(|u| u.user_id != self.client_info.user_id).map(|u| u.user_id);
+			}
+
 			let member_id = room.get_member_id(self.client_info.user_id);
 			if let Err(e) = member_id {
 				return e;

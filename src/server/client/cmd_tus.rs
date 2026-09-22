@@ -751,7 +751,7 @@ impl Client {
 						// account most recently finished. If the room has not
 						// broken up yet the reading stays on the save and the
 						// room claims it when it does.
-						match db.resolve_match_outcome(user_id, data_id, won, new_timestamp) {
+						match db.resolve_match_outcome(&com_id, user_id, data_id, won, new_timestamp) {
 							Ok(Some(match_id)) => debug!("Match {} resolved from a save by user {}", match_id, user_id),
 							Ok(None) => debug!("A result from user {} is waiting for its match to be recorded", user_id),
 							Err(e) => warn!("Failed to resolve a match outcome for user {}: {:?}", user_id, e),
@@ -1053,7 +1053,15 @@ impl Client {
 				return Ok(ErrorType::Unauthorized);
 			}
 
-			db.tus_delete_user_data_with_slotlist(&com_id, user_id, &tus_req.slot_id_array).map_err(|_| ErrorType::DbFail)?
+			db.tus_delete_user_data_with_slotlist(&com_id, user_id, &tus_req.slot_id_array).map_err(|_| ErrorType::DbFail)?;
+
+			// The slot's save is gone, so what the server held it to no longer
+			// describes anything. Left behind, the next save written into the
+			// slot is read as one already at its floor and goes without the
+			// starting rank.
+			if let Err(e) = db.tus_clear_rank_floor(&com_id, user_id, &tus_req.slot_id_array) {
+				warn!("Failed to clear the rank floor for user {}: {:?}", user_id, e);
+			}
 		}
 
 		Ok(ErrorType::NoError)

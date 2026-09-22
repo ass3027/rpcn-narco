@@ -141,6 +141,12 @@ struct LeaderboardEntry {
 	server_record: PlayerRecord,
 }
 
+/// Highest slot a leaderboard is served for. Titles use a handful; the cache
+/// is keyed by it, so it is bounded rather than taken as given.
+const MAX_LEADERBOARD_SLOT: i32 = 32;
+/// How many boards may be cached at once, across every title and slot.
+const MAX_LEADERBOARD_CACHE: usize = 64;
+
 struct CachedResponse {
 	timestamp: AtomicU32,
 	cached_response: Mutex<Response<String>>,
@@ -723,11 +729,17 @@ impl StatServer {
 			if rest.len() == COMMUNICATION_ID_SIZE {
 				let mut com_id: ComId = [0u8; COMMUNICATION_ID_SIZE];
 				com_id.copy_from_slice(rest.as_bytes());
+				// The cache is keyed by these, so an unvalidated title or an
+				// arbitrary slot from the query string would let anyone grow
+				// it without limit.
+				if !rest.bytes().all(|b| b.is_ascii_alphanumeric()) {
+					return Ok(StatServer::json_response(StatusCode::BAD_REQUEST, "{\"error\":\"invalid_request\"}".to_owned()));
+				}
 				let query = req.uri().query();
 				// A whole population is a reasonable thing to ask for here,
 				// unlike a match list, so the ceiling is higher.
 				let limit = StatServer::parse_limit_with(query, 100, 10_000);
-				let slot = StatServer::query_param(query, "slot").and_then(|v| v.parse::<i32>().ok()).unwrap_or(1);
+				let slot = StatServer::query_param(query, "slot").and_then(|v| v.parse::<i32>().ok()).unwrap_or(1).clamp(1, MAX_LEADERBOARD_SLOT);
 				return StatServer::handle_leaderboard_req(&com_id, rest, slot, limit, cache_life, &json_cache, db_pool).await;
 			}
 		}
@@ -983,25 +995,25 @@ impl StatServer {
 		com_id.copy_from_slice(com_id_str.as_bytes());
 
 		let owned_npid = npid.to_owned();
+		let pool_for_save = db_pool.clone();
 		let lookup = tokio::task::spawn_blocking(move || {
 			let connection = db_pool.get().map_err(|_| DbError::Internal)?;
 			let db = Database::new(connection);
 			let user_id = db.get_user_id(&owned_npid)?;
 			let online_name = db.get_online_name(user_id)?;
 			let (status, _) = db.tus_get_user_data(&com_id, user_id, slot)?;
-			Ok::<_, DbError>((online_name, status.data_id))
+			Ok::<_, DbError>((user_id, online_name, status.data_id))
 		})
 		.await;
 
-		let (online_name, data_id) = match lookup {
+		let (user_id, online_name, data_id) = match lookup {
 			Ok(Ok(found)) => found,
 			Ok(Err(DbError::Empty)) => return Ok(StatServer::json_response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}".to_owned())),
 			_ => return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
 		};
 
-		let save = match Client::get_tus_data_file(data_id).await {
-			Ok(save) => save,
-			Err(_) => return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"save_unreadable\"}".to_owned())),
+		let Some(save) = StatServer::read_current_save(&pool_for_save, &com_id, user_id, slot, data_id).await else {
+			return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"save_unreadable\"}".to_owned()));
 		};
 
 		let characters = match game_specific_tus::read_character_ranks(&com_id, &save) {
@@ -1076,6 +1088,7 @@ impl StatServer {
 		}
 
 		let owned_com_id = *com_id;
+		let pool_for_saves = db_pool.clone();
 		let listing = tokio::task::spawn_blocking(move || {
 			let connection = db_pool.get().map_err(|_| DbError::Internal)?;
 			let db = Database::new(connection);
@@ -1094,7 +1107,7 @@ impl StatServer {
 		let mut unreadable = 0usize;
 
 		for owner in owners {
-			let Ok(save) = Client::get_tus_data_file(owner.data_id).await else {
+			let Some(save) = StatServer::read_current_save(&pool_for_saves, com_id, owner.user_id, slot, owner.data_id).await else {
 				unreadable += 1;
 				continue;
 			};
@@ -1151,6 +1164,12 @@ impl StatServer {
 
 		{
 			let mut cache = json_cache.leaderboard_cache.lock();
+			// Titles are few and slots are clamped, so passing this means
+			// something is wrong rather than busy: start over rather than
+			// grow without bound.
+			if cache.len() >= MAX_LEADERBOARD_CACHE && !cache.contains_key(&key) {
+				cache.clear();
+			}
 			let cached = cache.entry(key).or_insert_with(CachedResponse::new);
 			*cached.cached_response.lock() = Response::new(json.clone());
 			cached.timestamp.store(new_timestamp, Ordering::SeqCst);
@@ -1175,6 +1194,31 @@ impl StatServer {
 			Err(_) => json,
 		};
 		Response::builder().header("Content-Type", "application/json").body(trimmed).unwrap()
+	}
+
+	/// Reads the save a slot currently points at, once more if it vanishes.
+	///
+	/// A save is deleted the moment the next one replaces it, so a reader that
+	/// looked up the `data_id` a moment ago can find the file already gone.
+	/// That is not an error, just a player who saved in between: look the slot
+	/// up again and read what it points at now.
+	async fn read_current_save(db_pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>, com_id: &ComId, user_id: i64, slot: i32, data_id: u64) -> Option<Vec<u8>> {
+		if let Ok(save) = Client::get_tus_data_file(data_id).await {
+			return Some(save);
+		}
+
+		let pool = db_pool.clone();
+		let owned_com_id = *com_id;
+		let again = tokio::task::spawn_blocking(move || {
+			let connection = pool.get().map_err(|_| DbError::Internal)?;
+			Database::new(connection).tus_get_user_data(&owned_com_id, user_id, slot).map(|(status, _)| status.data_id)
+		})
+		.await;
+
+		match again {
+			Ok(Ok(current)) if current != data_id => Client::get_tus_data_file(current).await.ok(),
+			_ => None,
+		}
 	}
 
 	/// A query parameter, without pulling in a query string parser.

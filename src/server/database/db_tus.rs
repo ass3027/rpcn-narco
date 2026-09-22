@@ -600,6 +600,24 @@ impl Database {
 			})
 	}
 
+	/// Forgets what a slot was held to, for when its save is deleted. Without
+	/// this a fresh save is read as one already held to the recorded floor and
+	/// is left without its starting rank.
+	pub fn tus_clear_rank_floor(&self, com_id: &ComId, user: i64, slots: &[i32]) -> Result<(), DbError> {
+		for slot in slots {
+			self.conn
+				.execute(
+					"DELETE FROM tus_rank_floor WHERE owner_id = ?1 AND communication_id = ?2 AND slot_id = ?3",
+					rusqlite::params![user, com_id, slot],
+				)
+				.map_err(|e| {
+					error!("Unexpected error in tus_clear_rank_floor: {}", e);
+					DbError::Internal
+				})?;
+		}
+		Ok(())
+	}
+
 	/// Notes that the client now has the raised save, which is the point from
 	/// which a demotion below the floor is the player's own.
 	pub fn tus_mark_rank_floor_delivered(&self, com_id: &ComId, user: i64, slot: i32) -> Result<(), DbError> {

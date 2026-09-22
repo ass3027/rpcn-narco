@@ -1017,6 +1017,28 @@ impl Database {
 			return Err(DbError::Internal);
 		}
 
+		// The history tables follow the same convention as the ones above: the
+		// rows stay and point at the deleted user, so a match one side of which
+		// has left still lists and still counts the same way.
+		for (table, column) in [
+			("tus_data_history", "owner_id"),
+			("match_history", "user_id_1"),
+			("match_history", "user_id_2"),
+			("match_history", "winner_id"),
+		] {
+			let query = format!("UPDATE {} SET {} = ?1 WHERE {} = ?2", table, column, column);
+			if let Err(e) = self.conn.execute(&query, rusqlite::params![deleted_userid, user_id]) {
+				error!("Unexpected error updating deleted user in {}.{}: {}", table, column, e);
+				return Err(DbError::Internal);
+			}
+		}
+
+		// Nothing to carry over: the floor describes a save this account owned.
+		if let Err(e) = self.conn.execute("DELETE FROM tus_rank_floor WHERE owner_id = ?1", rusqlite::params![user_id]) {
+			error!("Unexpected error deleting the rank floor of a deleted user: {}", e);
+			return Err(DbError::Internal);
+		}
+
 		if let Err(e) = self.conn.execute("DELETE FROM account WHERE user_id = ?1", rusqlite::params![user_id]) {
 			error!("Unexpected error deleting user from account: {}", e);
 			return Err(DbError::Internal);
@@ -1244,7 +1266,7 @@ impl Database {
 		// The title may have written its save before the room broke up, in
 		// which case the result is already waiting to be claimed.
 		for user in [low, high] {
-			if let Err(e) = self.claim_pending_outcome(match_id, low, high, user, timestamp) {
+			if let Err(e) = self.claim_pending_outcome(com_id, match_id, low, high, user, timestamp) {
 				warn!("Failed to claim a pending match outcome for user {}: {:?}", user, e);
 			}
 		}
@@ -1252,10 +1274,24 @@ impl Database {
 		Ok(())
 	}
 
-	/// How far apart the save reporting a result and the room breaking up may
-	/// sit and still be taken for the same match. PSN timestamps are
-	/// microseconds, so this is ten minutes.
-	const OUTCOME_WINDOW: u64 = 10 * 60 * 1_000_000;
+	/// How long after a room breaks up a save may still be taken to be
+	/// reporting on it. PSN timestamps are microseconds, so this is 30
+	/// seconds.
+	///
+	/// It has to be shorter than a match, because the two events arrive in
+	/// either order. When the save comes first its own match is not recorded
+	/// yet, so the most recent match on file is the *previous* one, and a
+	/// window wide enough to reach it writes this result onto that. A window
+	/// under one match length cannot reach back that far, and the save waits
+	/// for `claim_pending_outcome` instead. Simulated over both orders with
+	/// back to back rematches and a fifth of matches never reported: 30
+	/// seconds misattributes none, 60 seconds misattributes some.
+	const SAVE_WINDOW: u64 = 30 * 1_000_000;
+
+	/// How far back a freshly recorded match looks for a save already waiting
+	/// to be claimed. Generous, because such a save is consumed once and is
+	/// only ever claimed by a match the account actually played.
+	const CLAIM_WINDOW: u64 = 10 * 60 * 1_000_000;
 
 	/// Attaches a result read out of a save to the match it belongs to.
 	///
@@ -1281,16 +1317,19 @@ impl Database {
 	/// itself to whatever older match of the account's was still unresolved.
 	///
 	/// Returns the match it resolved, if any.
-	pub fn resolve_match_outcome(&self, user_id: i64, data_id: u64, won: bool, timestamp: u64) -> Result<Option<i64>, DbError> {
-		let floor = timestamp.saturating_sub(Self::OUTCOME_WINDOW);
+	pub fn resolve_match_outcome(&self, com_id: &ComId, user_id: i64, data_id: u64, won: bool, timestamp: u64) -> Result<Option<i64>, DbError> {
+		let floor = timestamp.saturating_sub(Self::SAVE_WINDOW);
 
-		let found: rusqlite::Result<(i64, Option<i64>, i64, i64)> = self.conn.query_row(
-			"SELECT match_id, winner_id, user_id_1, user_id_2 FROM match_history m WHERE ( user_id_1 = ?1 OR user_id_2 = ?1 ) AND timestamp >= ?2 			 AND NOT EXISTS ( SELECT 1 FROM tus_data_history h WHERE h.owner_id = ?1 AND h.resolved_match_id = m.match_id ) ORDER BY match_id DESC LIMIT 1",
-			rusqlite::params![user_id, floor],
-			|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+		// Only ever the single most recent match, and only of this title: a
+		// room is recorded for every game, and reaching past the newest match
+		// is how a result lands on the wrong one.
+		let found: rusqlite::Result<(i64, Option<i64>, i64, i64, bool)> = self.conn.query_row(
+			"SELECT m.match_id, m.winner_id, m.user_id_1, m.user_id_2, 			 EXISTS ( SELECT 1 FROM tus_data_history h WHERE h.owner_id = ?1 AND h.resolved_match_id = m.match_id ) 			 FROM match_history m WHERE m.communication_id = ?2 AND ( m.user_id_1 = ?1 OR m.user_id_2 = ?1 ) AND m.timestamp >= ?3 			 ORDER BY m.match_id DESC LIMIT 1",
+			rusqlite::params![user_id, com_id, floor],
+			|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
 		);
 
-		let (match_id, winner_id, user_id_1, user_id_2) = match found {
+		let (match_id, winner_id, user_id_1, user_id_2, already_reported) = match found {
 			Ok(row) => row,
 			Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
 			Err(e) => {
@@ -1298,6 +1337,12 @@ impl Database {
 				return Err(DbError::Internal);
 			}
 		};
+
+		// The account has already spoken about this one, so this save is
+		// reporting on a match the room has not finished breaking up yet.
+		if already_reported {
+			return Ok(None);
+		}
 
 		let expected = if won {
 			user_id
@@ -1324,12 +1369,12 @@ impl Database {
 
 	/// The other direction: a match has just been recorded and the save
 	/// reporting its result had already arrived.
-	fn claim_pending_outcome(&self, match_id: i64, user_id_1: i64, user_id_2: i64, user_id: i64, timestamp: u64) -> Result<(), DbError> {
-		let floor = timestamp.saturating_sub(Self::OUTCOME_WINDOW);
+	fn claim_pending_outcome(&self, com_id: &ComId, match_id: i64, user_id_1: i64, user_id_2: i64, user_id: i64, timestamp: u64) -> Result<(), DbError> {
+		let floor = timestamp.saturating_sub(Self::CLAIM_WINDOW);
 
 		let found: rusqlite::Result<(u64, i64)> = self.conn.query_row(
-			"SELECT data_id, outcome FROM tus_data_history WHERE owner_id = ?1 AND outcome IS NOT NULL AND resolved_match_id IS NULL AND timestamp >= ?2 ORDER BY data_id DESC LIMIT 1",
-			rusqlite::params![user_id, floor],
+			"SELECT data_id, outcome FROM tus_data_history WHERE owner_id = ?1 AND communication_id = ?2 AND outcome IS NOT NULL AND resolved_match_id IS NULL AND timestamp >= ?3 ORDER BY data_id DESC LIMIT 1",
+			rusqlite::params![user_id, com_id, floor],
 			|r| Ok((r.get(0)?, r.get(1)?)),
 		);
 
