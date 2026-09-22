@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A TUS save that replaces another now deletes the one it replaced, instead of leaving it for the next restart to sweep up
 - The usage endpoint no longer reports players' IP addresses to unauthenticated callers, which it did alongside their names
+- The rank floor is now tracked by the server rather than inferred from consecutive saves, because a client writes back its own copy for a whole session and a raise made between its fetches was undone by its next save
 
 ### Fixed
 

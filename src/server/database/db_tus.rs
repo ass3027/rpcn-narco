@@ -567,6 +567,54 @@ impl Database {
 			})
 	}
 
+	/// What floor this slot has already been held to, and whether the client
+	/// has fetched the save since. Absent for a slot never held to one.
+	pub fn tus_get_rank_floor(&self, com_id: &ComId, user: i64, slot: i32) -> Result<Option<(u8, bool)>, DbError> {
+		let res: rusqlite::Result<(u8, bool)> = self.conn.query_row(
+			"SELECT floor, delivered FROM tus_rank_floor WHERE owner_id = ?1 AND communication_id = ?2 AND slot_id = ?3",
+			rusqlite::params![user, com_id, slot],
+			|r| Ok((r.get(0)?, r.get(1)?)),
+		);
+
+		match res {
+			Ok(found) => Ok(Some(found)),
+			Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+			Err(e) => {
+				error!("Unexpected error in tus_get_rank_floor: {}", e);
+				Err(DbError::Internal)
+			}
+		}
+	}
+
+	/// Records the floor a slot is now held to.
+	pub fn tus_set_rank_floor(&self, com_id: &ComId, user: i64, slot: i32, floor: u8, delivered: bool) -> Result<(), DbError> {
+		self.conn
+			.execute(
+				"INSERT INTO tus_rank_floor ( owner_id, communication_id, slot_id, floor, delivered ) VALUES ( ?1, ?2, ?3, ?4, ?5 ) 				 ON CONFLICT ( owner_id, communication_id, slot_id ) DO UPDATE SET floor = ?4, delivered = ?5",
+				rusqlite::params![user, com_id, slot, floor, delivered],
+			)
+			.map(|_| ())
+			.map_err(|e| {
+				error!("Unexpected error in tus_set_rank_floor: {}", e);
+				DbError::Internal
+			})
+	}
+
+	/// Notes that the client now has the raised save, which is the point from
+	/// which a demotion below the floor is the player's own.
+	pub fn tus_mark_rank_floor_delivered(&self, com_id: &ComId, user: i64, slot: i32) -> Result<(), DbError> {
+		self.conn
+			.execute(
+				"UPDATE tus_rank_floor SET delivered = 1 WHERE owner_id = ?1 AND communication_id = ?2 AND slot_id = ?3 AND delivered = 0",
+				rusqlite::params![user, com_id, slot],
+			)
+			.map(|_| ())
+			.map_err(|e| {
+				error!("Unexpected error in tus_mark_rank_floor_delivered: {}", e);
+				DbError::Internal
+			})
+	}
+
 	/// Every account that holds a save in one slot of one title.
 	///
 	/// What a leaderboard is built from: the ranks a title keeps live inside

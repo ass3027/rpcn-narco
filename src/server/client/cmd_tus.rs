@@ -715,8 +715,17 @@ impl Client {
 				Err(DbError::Empty) => (None, None),
 				Err(_) => return Err(ErrorType::DbFail),
 			};
-			let floored_data = game_specific_tus::apply_rank_floor(&com_id, &tus_req.data, previous_save.as_deref());
-			let data_to_store: &[u8] = floored_data.as_deref().unwrap_or(&tus_req.data);
+			// The crossing is read from what the server recorded, not from the
+			// saves: the client writes back its own copy for a whole session
+			// without fetching, so the previous save is not evidence of what
+			// the player has actually been given.
+			let floor_state = match db.tus_get_rank_floor(&com_id, user_id, slot) {
+				Ok(Some((applied, delivered))) => game_specific_tus::FloorState { applied: Some(applied), delivered },
+				Ok(None) => game_specific_tus::FloorState::default(),
+				Err(_) => return Err(ErrorType::DbFail),
+			};
+			let floored = game_specific_tus::apply_rank_floor(&com_id, &tus_req.data, floor_state);
+			let data_to_store: &[u8] = floored.as_ref().and_then(|f| f.data.as_deref()).unwrap_or(&tus_req.data);
 
 			// The same pair of saves says how the match that preceded them
 			// went, for a title that keeps a running record. Read it off the
@@ -746,6 +755,16 @@ impl Client {
 							Ok(Some(match_id)) => debug!("Match {} resolved from a save by user {}", match_id, user_id),
 							Ok(None) => debug!("A result from user {} is waiting for its match to be recorded", user_id),
 							Err(e) => warn!("Failed to resolve a match outcome for user {}: {:?}", user_id, e),
+						}
+					}
+					if let Some(floored) = &floored {
+						// A raise the client has not been handed yet stays
+						// undelivered, so the next save it sends - written
+						// without it - is raised again. Nothing raised means
+						// nothing to deliver.
+						let delivered = floored.data.is_none();
+						if let Err(e) = db.tus_set_rank_floor(&com_id, user_id, slot, floored.floor, delivered) {
+							warn!("Failed to record the rank floor for user {}: {:?}", user_id, e);
 						}
 					}
 					// The slot now points at the new save, so the one it
@@ -823,6 +842,14 @@ impl Client {
 				Vec::new(),
 			)
 		};
+
+		// The player now holds whatever the server last wrote, including a rank
+		// floor it raised. From here a demotion below that floor is their own.
+		if !user.vuser && *npid == self.client_info.npid {
+			if let Err(e) = db.tus_mark_rank_floor_delivered(&com_id, self.client_info.user_id, slot) {
+				warn!("Failed to mark the rank floor delivered for {}: {:?}", npid, e);
+			}
+		}
 
 		let final_tus_data = TusData { status, data: tus_data };
 

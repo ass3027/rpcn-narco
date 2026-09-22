@@ -102,7 +102,7 @@ struct MigrationData {
 
 static DATABASE_PATH: &str = "db/rpcn.db";
 
-static DATABASE_MIGRATIONS: [MigrationData; 12] = [
+static DATABASE_MIGRATIONS: [MigrationData; 13] = [
 	MigrationData {
 		version: 1,
 		text: "Initial setup",
@@ -163,14 +163,23 @@ static DATABASE_MIGRATIONS: [MigrationData; 12] = [
 		text: "Adding history tables for tus saves and finished matches",
 		function: add_history_tables,
 	},
+	MigrationData {
+		version: 13,
+		text: "Add rank floor tracking",
+		function: add_rank_floor_table,
+	},
 ];
 
 /// Two append only tables.
 ///
-/// `tus_data_history` keeps one row per stored save. `tus_data` only ever
-/// holds the current `data_id` for a slot, so without this the association
-/// between a save file and the account that wrote it is lost as soon as the
-/// next save replaces it.
+/// `tus_data_history` keeps one row per stored save: who wrote it, when, and
+/// what it said about the match before it. `tus_data` only ever holds the
+/// current `data_id` for a slot, so without this there is no record that the
+/// save happened at all once the next one replaces it.
+///
+/// It is an index, not a way back to the bytes. The file a row names is
+/// deleted as soon as the next save replaces it, and `clean_tus_data` sweeps
+/// anything `tus_data` no longer points at on the next restart.
 ///
 /// `match_history` keeps one row per finished two player room. The room
 /// manager already knows both participants when the room breaks up, but that
@@ -208,6 +217,28 @@ fn add_history_tables(conn: &r2d2::PooledConnection<r2d2_sqlite::SqliteConnectio
 		.map_err(|e| format!("Error creating tus_data_history_pending index: {}", e))?;
 	conn.execute("CREATE INDEX IF NOT EXISTS match_history_pending ON match_history(winner_id)", [])
 		.map_err(|e| format!("Error creating match_history_pending index: {}", e))?;
+
+	Ok(())
+}
+
+/// What the server has already done to a slot's ranks.
+///
+/// A title whose ranks are raised at a tier crossing has to know that the
+/// crossing happened. It cannot be read off the saves: the client holds its
+/// own copy for a whole session and writes it back after every match without
+/// fetching, so a raise the server makes is absent from the client's next
+/// save and comparing the two would read the crossing as already handled.
+///
+/// `delivered` records whether the client has fetched the slot since the
+/// floor was applied. Until it has, every save it sends was written in
+/// ignorance of the raise, so the raise is applied again; afterwards the
+/// player has it and a demotion below the floor is theirs to keep.
+fn add_rank_floor_table(conn: &r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>) -> Result<(), String> {
+	conn.execute(
+		"CREATE TABLE IF NOT EXISTS tus_rank_floor ( owner_id UNSIGNED BIGINT NOT NULL, communication_id TEXT NOT NULL, slot_id INTEGER NOT NULL, floor INTEGER NOT NULL, delivered BOOL NOT NULL, PRIMARY KEY ( owner_id, communication_id, slot_id ) )",
+		[],
+	)
+	.map_err(|e| format!("Failed to create tus_rank_floor table: {}", e))?;
 
 	Ok(())
 }

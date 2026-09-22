@@ -23,6 +23,14 @@
 //! tier. A character that is later demoted below the floor stays there, so a
 //! character raised past the player's actual ability still finds its way back
 //! down.
+//!
+//! "Later" means after the player has actually been handed the raise. A client
+//! holds its own copy of the save for a whole session and writes it back after
+//! every match without fetching - roughly twenty saves per fetch - so a raise
+//! the server makes is missing from the next save it sends. That is not a
+//! demotion, so the raise is re-applied until a fetch has delivered it. The
+//! server therefore records what it has done rather than inferring it from a
+//! pair of saves; see `FloorState`.
 
 use tracing::{debug, warn};
 
@@ -200,18 +208,45 @@ fn stored_checksum(record: &[u8]) -> u32 {
 	u32::from_be_bytes([record[0], record[1], record[2], record[3]])
 }
 
+/// What the server remembers about the floor it has already given a slot.
+///
+/// The crossing cannot be read off the save the client sends. A client holds
+/// its own copy for the whole session and writes it back on every match - 18
+/// saves for every 4 fetches across the population, ~20 in a row per player -
+/// so a raise the server makes is invisible to it and its next save puts the
+/// old ranks straight back. Comparing two saves to spot the crossing therefore
+/// sees the raise undone one match later and treats it as "already at this
+/// tier", and the raise is lost. The server records the crossing instead.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FloorState {
+	/// The floor this slot has already been held to, if it ever was.
+	pub applied: Option<u8>,
+	/// Whether the client has fetched the save since that floor was applied.
+	/// Until it has, the raise is re-applied on every save, because every one
+	/// of those saves was written without knowledge of it.
+	pub delivered: bool,
+}
+
+/// The result of holding a save to its floor.
+pub(crate) struct FloorApplied {
+	/// The rewritten save, or `None` when no character needed raising.
+	pub data: Option<Vec<u8>>,
+	/// The floor the slot is now held to, for the caller to record.
+	pub floor: u8,
+}
+
 /// Raises the ranks a save is entitled to, if any.
 ///
-/// `previous` is the save this one replaces, or `None` for the account's first
-/// save. A first save is brought up to the starting rank. Otherwise the ranks
-/// are only touched when the account's best character has just crossed into a
-/// new tier, so a character demoted below the floor since the last crossing
-/// stays where it fell.
+/// Acts on the transition: the roster is raised when the account crosses into
+/// a new tier, and a character demoted below the floor afterwards stays where
+/// it fell. `state` is what the server recorded the last time it acted, which
+/// is what makes "afterwards" mean after the player actually received the
+/// raise rather than after the next match.
 ///
-/// Returns the rewritten save, or `None` when nothing changed: another title,
-/// an unexpected size, a checksum that does not verify, no tier crossed, or
-/// every character already at or above the floor.
-pub(crate) fn apply_rank_floor(com_id: &ComId, data: &[u8], previous: Option<&[u8]>) -> Option<Vec<u8>> {
+/// Returns `None` for another title, an unexpected size, a checksum that does
+/// not verify, or a slot already held to this floor by a client that has seen
+/// it.
+pub(crate) fn apply_rank_floor(com_id: &ComId, data: &[u8], state: FloorState) -> Option<FloorApplied> {
 	if com_id != &NPWR02973_00 {
 		return None;
 	}
@@ -230,29 +265,34 @@ pub(crate) fn apply_rank_floor(com_id: &ComId, data: &[u8], previous: Option<&[u
 
 	let floor = floor_for(best_rank(data));
 
-	// Past the first save, only act on the transition. A previous save that is
-	// unreadable is treated as no previous save at all rather than guessed at.
-	if let Some(previous) = previous {
-		if previous.len() != RECORD_SIZE || checksum(previous) != stored_checksum(previous) {
-			debug!("NPWR02973_00 previous save is unusable, rank floor not applied");
-			return None;
-		}
-		if floor_for(best_rank(previous)) >= floor {
-			return None;
-		}
+	let act = match state.applied {
+		// Never held to a floor: a first save, or an account from before this
+		// existed.
+		None => true,
+		// Crossed into a new tier.
+		Some(applied) if floor > applied => true,
+		// Same tier, but the client has not been handed the raise yet, so this
+		// save cannot have taken it into account.
+		Some(applied) if floor == applied && !state.delivered => true,
+		_ => false,
+	};
+	if !act {
+		return None;
 	}
 
 	let mut out = data.to_vec();
 	let raised = raise_to(&mut out, floor);
 	if raised == 0 {
-		return None;
+		// Nothing to raise, but the caller still records the floor so that a
+		// character demoted below it later is left where it fell.
+		return Some(FloorApplied { data: None, floor });
 	}
 
 	let resealed = checksum(&out).to_be_bytes();
 	out[0..4].copy_from_slice(&resealed);
 
-	debug!(raised, floor, first_save = previous.is_none(), "NPWR02973_00 rank floor applied");
-	Some(out)
+	debug!(raised, floor, first = state.applied.is_none(), "NPWR02973_00 rank floor applied");
+	Some(FloorApplied { data: Some(out), floor })
 }
 
 /// Where the account totals live in the save.
@@ -429,6 +469,20 @@ mod tests {
 		record[0..4].copy_from_slice(&sum.to_be_bytes());
 	}
 
+	/// `apply_rank_floor` as the tests read it: just the rewritten save.
+	fn raised_by(com_id: &ComId, data: &[u8], state: FloorState) -> Option<Vec<u8>> {
+		apply_rank_floor(com_id, data, state).and_then(|applied| applied.data)
+	}
+
+	/// The state the server records after a save whose floor the client has
+	/// since fetched - the ordinary steady state between crossings.
+	fn seen(previous: &[u8]) -> FloorState {
+		FloorState {
+			applied: Some(floor_for(best_rank(previous))),
+			delivered: true,
+		}
+	}
+
 	fn rank_of(record: &[u8], character: usize) -> u8 {
 		record[CHAR_BASE + character * CHAR_STRIDE + CHAR_RANK]
 	}
@@ -520,7 +574,7 @@ mod tests {
 	#[test]
 	fn a_first_save_is_brought_up_to_the_starting_rank() {
 		let record = make_record(0);
-		let out = apply_rank_floor(&NPWR02973_00, &record, None).expect("a first save is raised");
+		let out = raised_by(&NPWR02973_00, &record, FloorState::default()).expect("a first save is raised");
 		for i in 0..CHAR_COUNT {
 			assert_eq!(rank_of(&out, i), STARTING_RANK);
 			assert_eq!(points_of(&out, i), STARTING_RANK_POINTS);
@@ -530,8 +584,8 @@ mod tests {
 
 	#[test]
 	fn a_first_save_already_at_the_starting_rank_is_left_alone() {
-		assert!(apply_rank_floor(&NPWR02973_00, &make_record(STARTING_RANK), None).is_none());
-		assert!(apply_rank_floor(&NPWR02973_00, &make_record(STARTING_RANK + 5), None).is_none());
+		assert!(raised_by(&NPWR02973_00, &make_record(STARTING_RANK), FloorState::default()).is_none());
+		assert!(raised_by(&NPWR02973_00, &make_record(STARTING_RANK + 5), FloorState::default()).is_none());
 	}
 
 	#[test]
@@ -542,7 +596,7 @@ mod tests {
 		current[CHAR_BASE + CHAR_RANK] = 29;
 		reseal(&mut current);
 
-		let out = apply_rank_floor(&NPWR02973_00, &current, Some(&previous)).expect("the crossing raises the rest");
+		let out = raised_by(&NPWR02973_00, &current, seen(&previous)).expect("the crossing raises the rest");
 		assert_eq!(rank_of(&out, 0), 29, "the character that climbed is untouched");
 		for i in 1..CHAR_COUNT {
 			assert_eq!(rank_of(&out, i), 21, "character {}", i);
@@ -560,7 +614,7 @@ mod tests {
 		current[CHAR_BASE + CHAR_RANK] = 31; // same tier, so the floor is unchanged
 		reseal(&mut current);
 
-		assert!(apply_rank_floor(&NPWR02973_00, &current, Some(&previous)).is_none());
+		assert!(raised_by(&NPWR02973_00, &current, seen(&previous)).is_none());
 	}
 
 	#[test]
@@ -575,7 +629,7 @@ mod tests {
 		current[CHAR_BASE + CHAR_STRIDE + CHAR_RANK] = 14;
 		reseal(&mut current);
 
-		assert!(apply_rank_floor(&NPWR02973_00, &current, Some(&previous)).is_none());
+		assert!(raised_by(&NPWR02973_00, &current, seen(&previous)).is_none());
 	}
 
 	#[test]
@@ -588,7 +642,7 @@ mod tests {
 		current[kept + CHAR_RANK_POINTS..kept + CHAR_RANK_POINTS + 2].copy_from_slice(&1234u16.to_be_bytes());
 		reseal(&mut current);
 
-		let out = apply_rank_floor(&NPWR02973_00, &current, Some(&previous)).expect("the rest is raised");
+		let out = raised_by(&NPWR02973_00, &current, seen(&previous)).expect("the rest is raised");
 		assert_eq!(rank_of(&out, 3), 26, "a rank above the floor is left alone");
 		assert_eq!(points_of(&out, 3), 1234);
 		assert_eq!(rank_of(&out, 1), 21);
@@ -706,7 +760,7 @@ mod tests {
 		let previous = make_record_with_one_climber(22, 10, 28);
 		let current = make_record_with_one_climber(22, 10, 29);
 
-		let raised = apply_rank_floor(&NPWR02973_00, &current, Some(&previous)).expect("crossing 29 raises the roster");
+		let raised = raised_by(&NPWR02973_00, &current, seen(&previous)).expect("crossing 29 raises the roster");
 		assert_eq!(rank_of(&raised, 1), 21, "floor for 29 is 21, not the 13 that reading only the characters would give");
 		assert_eq!(rank_of(&raised, 0), 22, "the character the player climbed with is untouched");
 	}
@@ -716,7 +770,7 @@ mod tests {
 		// Below 1st Dan the whole roster is raised to it. Leaving the account
 		// behind would rank it under every one of its own characters.
 		let record = make_record_with_account(3, 3);
-		let raised = apply_rank_floor(&NPWR02973_00, &record, None).expect("a first save is brought up to the starting rank");
+		let raised = raised_by(&NPWR02973_00, &record, FloorState::default()).expect("a first save is brought up to the starting rank");
 
 		assert_eq!(rank_of(&raised, 0), STARTING_RANK);
 		assert_eq!(raised[ACCOUNT_RANK], STARTING_RANK);
@@ -726,37 +780,60 @@ mod tests {
 	fn an_account_rank_above_the_floor_is_left_alone() {
 		let previous = make_record_with_one_climber(22, 10, 28);
 		let current = make_record_with_one_climber(22, 10, 29);
-		let raised = apply_rank_floor(&NPWR02973_00, &current, Some(&previous)).unwrap();
+		let raised = raised_by(&NPWR02973_00, &current, seen(&previous)).unwrap();
 		assert_eq!(raised[ACCOUNT_RANK], 29, "the high water mark is never pulled down to the floor");
 	}
 
 	#[test]
 	fn ignores_other_titles() {
-		assert!(apply_rank_floor(b"NPWR00482_00", &make_record(0), None).is_none());
+		assert!(raised_by(b"NPWR00482_00", &make_record(0), FloorState::default()).is_none());
 	}
 
 	#[test]
 	fn ignores_an_unexpected_size() {
-		assert!(apply_rank_floor(&NPWR02973_00, &vec![0u8; 16], None).is_none());
+		assert!(raised_by(&NPWR02973_00, &vec![0u8; 16], FloorState::default()).is_none());
 	}
 
 	#[test]
 	fn refuses_a_save_whose_checksum_does_not_verify() {
 		let mut record = make_record(0);
 		record[0] ^= 0xFF;
-		assert!(apply_rank_floor(&NPWR02973_00, &record, None).is_none());
+		assert!(raised_by(&NPWR02973_00, &record, FloorState::default()).is_none());
 	}
 
 	#[test]
-	fn refuses_to_guess_when_the_previous_save_is_unusable() {
+	fn the_raise_is_re_applied_until_the_client_has_fetched_it() {
+		// The client writes ~20 saves for every fetch, every one of them from
+		// a copy that predates the raise. Until it has been handed the raised
+		// save, each of those writes must be raised again or the crossing is
+		// undone by the next match.
 		let mut current = make_record(STARTING_RANK);
 		current[CHAR_BASE + CHAR_RANK] = 29;
 		reseal(&mut current);
 
-		let mut corrupt_previous = make_record(STARTING_RANK);
-		corrupt_previous[0] ^= 0xFF;
+		let pending = FloorState { applied: Some(21), delivered: false };
+		let out = raised_by(&NPWR02973_00, &current, pending).expect("a raise the client has not seen is applied again");
+		assert_eq!(rank_of(&out, 1), 21);
+	}
 
-		assert!(apply_rank_floor(&NPWR02973_00, &current, Some(&corrupt_previous)).is_none());
-		assert!(apply_rank_floor(&NPWR02973_00, &current, Some(&vec![0u8; 16])).is_none());
+	#[test]
+	fn a_character_demoted_after_the_client_saw_the_floor_stays_down() {
+		let mut current = make_record(21);
+		current[CHAR_BASE + CHAR_RANK] = 29;
+		current[CHAR_BASE + CHAR_STRIDE + CHAR_RANK] = 14;
+		reseal(&mut current);
+
+		let seen_state = FloorState { applied: Some(21), delivered: true };
+		assert!(raised_by(&NPWR02973_00, &current, seen_state).is_none(), "once the player has the floor, a demotion below it stands");
+	}
+
+	#[test]
+	fn the_floor_is_recorded_even_when_no_character_needed_raising() {
+		// Otherwise the crossing is never written down, and the first
+		// demotion below the floor would be undone as though it were one.
+		let record = make_record(21);
+		let applied = apply_rank_floor(&NPWR02973_00, &record, FloorState::default()).expect("the floor is reported");
+		assert!(applied.data.is_none(), "every character already sits above the floor, so no bytes changed");
+		assert_eq!(applied.floor, 13, "the floor for a 21 account, two tiers down");
 	}
 }
