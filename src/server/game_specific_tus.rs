@@ -57,14 +57,49 @@ const TIER_DROP: usize = 2;
 
 /// Rank progress written to a character that is raised to a given rank.
 ///
-/// Below 1st Dan the ranks sit on a single absolute ladder of `200 * rank`,
-/// which holds without exception across the whole corpus. 1st Dan resets to
-/// zero. Above that each rank has its own range and no closed form, so these
-/// are the tenth percentile of the observed distribution: a raised character
-/// lands near the bottom of its new rank rather than one win from leaving it.
-/// Ranks with too thin a sample are interpolated from their neighbours.
+/// The progress value is a gauge inside one rank: a win adds 2000, a loss
+/// takes 2000, passing the top promotes and dropping below zero demotes. So
+/// where a character is placed inside that gauge decides how long the rank
+/// lasts, and putting it near the bottom hands back the rank after two losses.
+///
+/// These are where the game itself puts a character that has just arrived at
+/// the rank, measured as the median progress of a demotion into it - the lower
+/// of the two ways in, so a character raised here is never placed better off
+/// than one that fell here. That leaves 3 to 5 losses of room, the same as any
+/// character the game put there.
+///
+/// Below 1st Dan the ranks are a separate absolute ladder of `200 * rank`,
+/// which holds without exception across the corpus, and 1st Dan itself rests
+/// at zero and cannot be demoted out of.
 fn rank_points_for(rank: u8) -> u16 {
-	const OBSERVED: [(u8, u16); 10] = [(11, 2531), (12, 2735), (13, 2300), (14, 3112), (15, 2907), (16, 2799), (17, 5993), (18, 1562), (19, 1964), (21, 2679)];
+	/// Rank, then the median progress of a demotion into it. Every entry has
+	/// at least 26 observations except rank 33, which has one and takes the
+	/// median of the other tier openings instead.
+	const ENTRY: [(u8, u16); 23] = [
+		(10, 0),
+		(11, 7300),
+		(12, 7170),
+		(13, 7400),
+		(14, 7079),
+		(15, 7154),
+		(16, 6714),
+		(17, 11001),
+		(18, 6099),
+		(19, 5999),
+		(20, 5830),
+		(21, 8999),
+		(22, 5961),
+		(23, 5999),
+		(24, 5419),
+		(25, 10439),
+		(26, 6999),
+		(27, 6999),
+		(28, 7001),
+		(29, 9799),
+		(30, 6501),
+		(31, 6385),
+		(33, 10119),
+	];
 
 	if rank == 0 {
 		return 0;
@@ -72,26 +107,14 @@ fn rank_points_for(rank: u8) -> u16 {
 	if rank < 10 {
 		return 200 * rank as u16;
 	}
-	if rank == 10 {
-		return STARTING_RANK_POINTS;
-	}
-	if let Some(&(_, points)) = OBSERVED.iter().find(|&&(r, _)| r == rank) {
+	if let Some(&(_, points)) = ENTRY.iter().find(|&&(r, _)| r == rank) {
 		return points;
 	}
 
-	let below = OBSERVED.iter().filter(|&&(r, _)| r < rank).next_back();
-	let above = OBSERVED.iter().find(|&&(r, _)| r > rank);
-	match (below, above) {
-		(Some(&(lo_rank, lo)), Some(&(hi_rank, hi))) => {
-			let span = (hi_rank - lo_rank) as u32;
-			let step = (rank - lo_rank) as u32;
-			let interpolated = lo as u32 + (hi as u32 - lo as u32) * step / span;
-			interpolated as u16
-		}
-		(Some(&(_, lo)), None) => lo,
-		(None, Some(&(_, hi))) => hi,
-		(None, None) => 0,
-	}
+	// A rank nobody was seen arriving at, which the floor never produces and
+	// only an operator edit can ask for: take the nearest rank below, whose
+	// gauge is the closest thing to a measurement there is.
+	ENTRY.iter().filter(|&&(r, _)| r < rank).next_back().map_or(STARTING_RANK_POINTS, |&(_, points)| points)
 }
 
 /// The rank every character of this account is entitled to, given the best
@@ -473,10 +496,25 @@ mod tests {
 		for rank in 1..10u8 {
 			assert_eq!(rank_points_for(rank), 200 * rank as u16);
 		}
-		assert_eq!(rank_points_for(10), 0);
-		assert_eq!(rank_points_for(13), 2300, "an observed rank uses its own value");
-		let interpolated = rank_points_for(20);
-		assert!(interpolated > 0, "an unobserved rank is interpolated, not zero");
+		assert_eq!(rank_points_for(10), 0, "1st Dan rests at zero and cannot be demoted out of");
+		assert_eq!(rank_points_for(13), 7400, "a measured rank uses where the game puts an arrival");
+		assert_eq!(rank_points_for(35), 10119, "a rank past the table falls back to the nearest below");
+	}
+
+	#[test]
+	fn a_raised_character_is_not_left_one_loss_from_demotion() {
+		// The progress value is a gauge the size of a rank: a loss takes 2000
+		// off it, so a character placed near the bottom hands the rank back
+		// almost at once. Every rank the floor can produce must leave room for
+		// a losing streak, the way the game does for a character that fell in.
+		const LOSS: u16 = 2000;
+		for floor in TIERS.iter().take(TIERS.len() - TIER_DROP) {
+			if *floor == STARTING_RANK {
+				continue; // 1st Dan is the bottom, there is nothing to fall to.
+			}
+			let points = rank_points_for(*floor);
+			assert!(points >= 3 * LOSS, "rank {} is placed at {}, under three losses of room", floor, points);
+		}
 	}
 
 	#[test]
