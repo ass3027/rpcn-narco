@@ -548,7 +548,8 @@ impl StatServer {
 			// behind it changed.
 			let info = if info.is_empty() { None } else { Some(info.as_slice()) };
 			db.tus_set_user_data(&com_id, user_id, slot, data_id, &info, user_id, timestamp, None, None)?;
-			if let Err(e) = db.tus_record_data_history(&com_id, user_id, slot, data_id, timestamp) {
+			// An operator edit is not a match, so it reports no result.
+			if let Err(e) = db.tus_record_data_history(&com_id, user_id, slot, data_id, timestamp, None) {
 				warn!("Failed to record tus data history for operator edit {}: {:?}", data_id, e);
 			}
 			Ok::<_, DbError>(())
