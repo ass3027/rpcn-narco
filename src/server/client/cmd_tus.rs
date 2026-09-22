@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use prost::Message;
 use tokio::fs;
+use tracing::debug;
 
 use crate::server::Server;
 use crate::server::client::*;
@@ -716,6 +717,15 @@ impl Client {
 			let floored_data = game_specific_tus::apply_rank_floor(&com_id, &tus_req.data, previous_save.as_deref());
 			let data_to_store: &[u8] = floored_data.as_deref().unwrap_or(&tus_req.data);
 
+			// The same pair of saves says how the match that preceded them
+			// went, for a title that keeps a running record. Read it off the
+			// data the client sent rather than the data being stored, so an
+			// edit made above can never look like a result.
+			let outcome = previous_save
+				.as_deref()
+				.and_then(|previous| game_specific_tus::match_outcome(&com_id, &tus_req.data, previous))
+				.map(|outcome| outcome == game_specific_tus::MatchOutcome::Won);
+
 			let data_id = Client::create_tus_data_file(data_to_store).await;
 
 			let res = db.tus_set_user_data(&com_id, user_id, slot, data_id, &info, user_id, new_timestamp, compare_timestamp, compare_author_id);
@@ -723,8 +733,19 @@ impl Client {
 				Ok(()) => {
 					// Best effort: the save itself already succeeded, so a
 					// failure to record the history must not fail the request.
-					if let Err(e) = db.tus_record_data_history(&com_id, user_id, slot, data_id, new_timestamp) {
+					if let Err(e) = db.tus_record_data_history(&com_id, user_id, slot, data_id, new_timestamp, outcome) {
 						warn!("Failed to record tus data history for data_id {}: {:?}", data_id, e);
+					} else if let Some(won) = outcome {
+						// Nobody tells the server who won a match, so the
+						// match this save reports on is whichever one the
+						// account most recently finished. If the room has not
+						// broken up yet the reading stays on the save and the
+						// room claims it when it does.
+						match db.resolve_match_outcome(user_id, data_id, won, new_timestamp) {
+							Ok(Some(match_id)) => debug!("Match {} resolved from a save by user {}", match_id, user_id),
+							Ok(None) => debug!("A result from user {} is waiting for its match to be recorded", user_id),
+							Err(e) => warn!("Failed to resolve a match outcome for user {}: {:?}", user_id, e),
+						}
 					}
 					// The slot now points at the new save, so the one it
 					// replaced is unreachable. Left behind it would accumulate

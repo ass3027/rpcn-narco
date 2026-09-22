@@ -206,6 +206,63 @@ pub(crate) fn apply_rank_floor(com_id: &ComId, data: &[u8], previous: Option<&[u
 	Some(out)
 }
 
+/// Where the account totals live in the save.
+const TOTAL_WINS: usize = 0xCDC;
+const TOTAL_LOSSES: usize = 0xCE0;
+
+/// How a match the account just finished went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchOutcome {
+	Won,
+	Lost,
+}
+
+fn account_total(record: &[u8], offset: usize) -> u32 {
+	u32::from_be_bytes([record[offset], record[offset + 1], record[offset + 2], record[offset + 3]])
+}
+
+/// Reads a match result out of the difference between two saves.
+///
+/// The server never sees the result of a match: play is peer to peer and the
+/// title reports nothing about it. What it does see is the save written
+/// afterwards, which carries the account's running totals, so one more win
+/// than the save before it means the account won.
+///
+/// Returns `None` for a save that did not follow a match, which is most of
+/// them - the title also re-uploads an unchanged record - and for anything it
+/// cannot read with confidence.
+pub fn match_outcome(com_id: &ComId, current: &[u8], previous: &[u8]) -> Option<MatchOutcome> {
+	if com_id != &NPWR02973_00 {
+		return None;
+	}
+	if current.len() != RECORD_SIZE || previous.len() != RECORD_SIZE {
+		return None;
+	}
+	if checksum(current) != stored_checksum(current) || checksum(previous) != stored_checksum(previous) {
+		return None;
+	}
+
+	let wins = account_total(current, TOTAL_WINS).checked_sub(account_total(previous, TOTAL_WINS))?;
+	let losses = account_total(current, TOTAL_LOSSES).checked_sub(account_total(previous, TOTAL_LOSSES))?;
+
+	// Exactly one of the two moved, by exactly one. Anything else is a save
+	// that did not follow a single match, and guessing at it would be worse
+	// than recording nothing.
+	match (wins, losses) {
+		(1, 0) => Some(MatchOutcome::Won),
+		(0, 1) => Some(MatchOutcome::Lost),
+		_ => None,
+	}
+}
+
+/// The account's running totals, for reporting a record.
+pub fn account_record(com_id: &ComId, record: &[u8]) -> Option<(u32, u32)> {
+	if com_id != &NPWR02973_00 || record.len() != RECORD_SIZE || checksum(record) != stored_checksum(record) {
+		return None;
+	}
+	Some((account_total(record, TOTAL_WINS), account_total(record, TOTAL_LOSSES)))
+}
+
 /// What one character of a save looked like before or after an edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CharacterRank {
@@ -498,6 +555,65 @@ mod tests {
 		assert_eq!(ranks[7].rank, 29);
 		assert_eq!(ranks[0].rank, 10);
 		assert!(ranks.iter().enumerate().all(|(i, c)| c.character == i));
+	}
+
+	#[test]
+	fn a_win_and_a_loss_are_read_from_the_account_totals() {
+		let previous = make_record(10);
+		let mut won = previous.clone();
+		won[TOTAL_WINS + 3] = 1;
+		reseal(&mut won);
+		assert_eq!(match_outcome(&NPWR02973_00, &won, &previous), Some(MatchOutcome::Won));
+
+		let mut lost = previous.clone();
+		lost[TOTAL_LOSSES + 3] = 1;
+		reseal(&mut lost);
+		assert_eq!(match_outcome(&NPWR02973_00, &lost, &previous), Some(MatchOutcome::Lost));
+	}
+
+	#[test]
+	fn a_save_that_did_not_follow_a_match_reports_nothing() {
+		let previous = make_record(10);
+
+		// The title re-uploads an unchanged record more often than not.
+		assert_eq!(match_outcome(&NPWR02973_00, &previous, &previous), None);
+
+		// Both totals moving, or either moving by more than one, is not a
+		// single match and must not be guessed at.
+		let mut both = previous.clone();
+		both[TOTAL_WINS + 3] = 1;
+		both[TOTAL_LOSSES + 3] = 1;
+		reseal(&mut both);
+		assert_eq!(match_outcome(&NPWR02973_00, &both, &previous), None);
+
+		let mut jumped = previous.clone();
+		jumped[TOTAL_WINS + 3] = 5;
+		reseal(&mut jumped);
+		assert_eq!(match_outcome(&NPWR02973_00, &jumped, &previous), None);
+	}
+
+	#[test]
+	fn a_total_going_backwards_reports_nothing() {
+		let mut previous = make_record(10);
+		previous[TOTAL_WINS + 3] = 4;
+		reseal(&mut previous);
+
+		let mut current = previous.clone();
+		current[TOTAL_WINS + 3] = 2;
+		reseal(&mut current);
+
+		assert_eq!(match_outcome(&NPWR02973_00, &current, &previous), None);
+	}
+
+	#[test]
+	fn the_account_record_reads_back() {
+		let mut record = make_record(10);
+		record[TOTAL_WINS + 2] = 1;
+		record[TOTAL_WINS + 3] = 44;
+		record[TOTAL_LOSSES + 3] = 7;
+		reseal(&mut record);
+		assert_eq!(account_record(&NPWR02973_00, &record), Some((300, 7)));
+		assert_eq!(account_record(b"NPWR00482_00", &record), None);
 	}
 
 	#[test]

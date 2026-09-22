@@ -510,11 +510,15 @@ impl Database {
 	/// `tus_data` is overwritten in place on every save, so this is the only
 	/// place the file to account association is kept. A failure here must not
 	/// fail the save itself, so the caller logs and carries on.
-	pub fn tus_record_data_history(&self, com_id: &ComId, user: i64, slot: i32, data_id: u64, timestamp: u64) -> Result<(), DbError> {
+	/// `outcome` is what the save says about the match that preceded it, where
+	/// the title stores enough to tell: `Some(true)` for a win, `Some(false)`
+	/// for a loss, `None` when the save did not follow a match or the title is
+	/// one nothing is known about.
+	pub fn tus_record_data_history(&self, com_id: &ComId, user: i64, slot: i32, data_id: u64, timestamp: u64, outcome: Option<bool>) -> Result<(), DbError> {
 		self.conn
 			.execute(
-				"INSERT OR IGNORE INTO tus_data_history ( data_id, owner_id, communication_id, slot_id, timestamp ) VALUES ( ?1, ?2, ?3, ?4, ?5 )",
-				rusqlite::params![data_id, user, com_id, slot, timestamp],
+				"INSERT OR IGNORE INTO tus_data_history ( data_id, owner_id, communication_id, slot_id, timestamp, outcome ) VALUES ( ?1, ?2, ?3, ?4, ?5, ?6 )",
+				rusqlite::params![data_id, user, com_id, slot, timestamp, outcome.map(|won| if won { 1 } else { 0 })],
 			)
 			.map(|_| ())
 			.map_err(|e| {

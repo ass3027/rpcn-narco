@@ -97,7 +97,17 @@ struct PlayerRanksResponse {
 	com_id: String,
 	slot: i32,
 	data_id: u64,
+	/// The account's running record as the title itself keeps it, for a title
+	/// whose save layout is known. Omitted otherwise.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	record: Option<PlayerRecord>,
 	characters: Vec<PlayerCharacterRank>,
+}
+
+#[derive(Serialize)]
+struct PlayerRecord {
+	wins: u32,
+	losses: u32,
 }
 
 struct CachedResponse {
@@ -839,7 +849,8 @@ impl StatServer {
 		}
 	}
 
-	/// One account's per character ranks, read out of the save it last wrote.
+	/// One account's per character ranks and running record, read out of the
+	/// save it last wrote.
 	///
 	/// Unauthenticated, like the rooms and score endpoints: ranks are what the
 	/// game shows to everyone in a lobby anyway.
@@ -886,6 +897,7 @@ impl StatServer {
 			com_id: com_id_str.to_owned(),
 			slot,
 			data_id,
+			record: game_specific_tus::account_record(&com_id, &save).map(|(wins, losses)| PlayerRecord { wins, losses }),
 			characters: characters
 				.into_iter()
 				.map(|c| PlayerCharacterRank {
@@ -915,7 +927,18 @@ impl StatServer {
 			let _ = writeln!(res, "    \"match_id\": {},", m.match_id);
 			let _ = writeln!(res, "    \"room_id\": {},", m.room_id);
 			let _ = writeln!(res, "    \"timestamp\": {},", m.timestamp);
-			let _ = writeln!(res, "    \"players\": [\"{}\", \"{}\"]", sanitize_for_json(&m.npid_1), sanitize_for_json(&m.npid_2));
+			let _ = writeln!(res, "    \"players\": [\"{}\", \"{}\"],", sanitize_for_json(&m.npid_1), sanitize_for_json(&m.npid_2));
+			// null means the result was never recovered, not a draw: nothing
+			// reports the result of a match directly and the save it is read
+			// from may never arrive.
+			match &m.winner_npid {
+				Some(winner) => {
+					let _ = writeln!(res, "    \"winner\": \"{}\"", sanitize_for_json(winner));
+				}
+				None => {
+					let _ = writeln!(res, "    \"winner\": null");
+				}
+			}
 			res += if index != matches.len() - 1 { "  },\n" } else { "  }\n" };
 		}
 		res += "]";
