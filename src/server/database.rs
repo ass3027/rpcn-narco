@@ -1111,6 +1111,43 @@ impl Database {
 		Ok(res.unwrap())
 	}
 
+	/// Won and lost counts per account, from the matches the server resolved.
+	///
+	/// This is the server's own tally, which is not the same as the record the
+	/// title keeps: it counts only matches played here and only those whose
+	/// result was recovered. Reported alongside the title's own numbers rather
+	/// than in place of them.
+	pub fn get_match_tallies(&self, com_id: &ComId) -> Result<HashMap<i64, (u32, u32)>, DbError> {
+		let mut stmt = self
+			.conn
+			.prepare("SELECT user_id_1, user_id_2, winner_id FROM match_history 				 WHERE communication_id = ?1 AND winner_id IS NOT NULL")
+			.map_err(|e| {
+				error!("Failed to prepare match tally statement: {}", e);
+				DbError::Internal
+			})?;
+
+		let rows = stmt
+			.query_map(rusqlite::params![com_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+			.map_err(|e| {
+				error!("Failed to query match tallies: {}", e);
+				DbError::Internal
+			})?;
+
+		let mut tallies: HashMap<i64, (u32, u32)> = HashMap::new();
+		for row in rows {
+			let (user_id_1, user_id_2, winner_id) = row.map_err(|e| {
+				error!("Failed to read a match tally row: {}", e);
+				DbError::Internal
+			})?;
+			for user in [user_id_1, user_id_2] {
+				let entry = tallies.entry(user).or_insert((0, 0));
+				if user == winner_id { entry.0 += 1 } else { entry.1 += 1 }
+			}
+		}
+
+		Ok(tallies)
+	}
+
 	/// A finished match as the stat server reports it.
 	pub fn get_recent_matches(&self, com_id: &ComId, limit: u32) -> Result<Vec<DbMatchRecord>, DbError> {
 		self.query_matches(

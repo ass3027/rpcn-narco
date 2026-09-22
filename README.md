@@ -71,9 +71,14 @@ GET /{StatServerPath}/matches/{com_id}[?limit=n]
 GET /{StatServerPath}/players/{npid}/matches[?limit=n]
 ```
 
-Both return `match_id`, `room_id`, `timestamp` and the two npids. `limit`
-defaults to 50 and is capped at 500. An npid with no account is a `404` rather
-than an empty list.
+Both return `match_id`, `room_id`, `timestamp`, the two npids and `winner`.
+`limit` defaults to 50 and is capped at 500. An npid with no account is a `404`
+rather than an empty list.
+
+`winner` is `null` when the result was never recovered, which is not the same
+as a draw. Nothing reports the result of a match - play is peer to peer - so it
+is read afterwards out of the running record in the save the account uploads,
+and a player who leaves without uploading one never reports.
 
 ## Per character ranks
 
@@ -84,7 +89,40 @@ wrote are readable:
 GET /{StatServerPath}/players/{npid}/ranks?com_id={com_id}[&slot=n]
 ```
 
-`slot` defaults to 1. A title the server has no layout for gets a `400`.
+`slot` defaults to 1. A title the server has no layout for gets a `400`. The
+response also carries `record`, the account's running win and loss totals as
+the title itself keeps them.
+
+## Leaderboard
+
+```text
+GET /{StatServerPath}/leaderboard/{com_id}[?limit=n][&slot=n]
+```
+
+Every account holding a save, ordered by its best character's rank, which is
+also the rank the client offers for matchmaking. Each entry carries its
+`position`, npid and online name, `best_rank`, `best_rank_points`,
+`best_character`, the `record` the title keeps, and `server_record` - the
+matches played on this server whose result it recovered, which is always the
+smaller pair of numbers.
+
+`limit` defaults to 100 and is capped at 10000. Banned accounts are left out,
+and `ranked_players` counts the whole board rather than the part `limit`
+returned.
+
+The ranks live inside the saves rather than in any table, so a board is built
+by reading every save of the title. It is therefore always cached, for at least
+30 seconds, even where `StatServerCacheLife` would turn caching off.
+
+## Reading from a browser
+
+Every response carries `Access-Control-Allow-Origin: *`, and a preflight is
+answered for `GET` alone. It does not allow `X-API-Key`, so the endpoints that
+take the operator key stay callable from a backend and not from a page.
+
+`/{StatServerPath}/usage` reports the name of every connected player. It also
+holds their IP addresses, which are filled in only for a caller presenting
+`X-API-Key`; everyone else gets a `null` in each address's place.
 
 ## Operator rank edit
 

@@ -16,6 +16,7 @@ use crate::server::game_specific_tus;
 use crate::server::room_manager::RoomManager;
 use crate::server::score_cache::{GetScoreResultCache, ScoresCache};
 use http_body_util::{BodyExt, Limited};
+use hyper::header::HeaderValue;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -110,6 +111,36 @@ struct PlayerRecord {
 	losses: u32,
 }
 
+#[derive(Serialize)]
+struct LeaderboardResponse {
+	com_id: String,
+	slot: i32,
+	/// How many accounts hold a readable save, which is what was ranked - not
+	/// how many are in `entries`, which `limit` cuts short.
+	ranked_players: usize,
+	/// Accounts holding a save this title's layout could not be read from.
+	unreadable_saves: usize,
+	entries: Vec<LeaderboardEntry>,
+}
+
+#[derive(Serialize)]
+struct LeaderboardEntry {
+	position: usize,
+	npid: String,
+	online_name: String,
+	/// The account's highest ranked character, which is also what the client
+	/// offers for matchmaking.
+	best_rank: u8,
+	best_rank_points: u16,
+	best_character: usize,
+	/// The record the title itself keeps, over the account's whole lifetime.
+	record: PlayerRecord,
+	/// What this server saw: matches played here whose result it recovered.
+	/// Always the smaller pair of numbers, and zero for a player whose matches
+	/// all predate the server recording them.
+	server_record: PlayerRecord,
+}
+
 struct CachedResponse {
 	timestamp: AtomicU32,
 	cached_response: Mutex<Response<String>>,
@@ -141,6 +172,9 @@ impl JsonScoreCache {
 struct JsonCache {
 	usage_cache: CachedResponse,
 	score_cache: JsonScoreCache,
+	/// Building a leaderboard reads every save of a title, so it is cached
+	/// like the score tables rather than rebuilt per request.
+	leaderboard_cache: Mutex<HashMap<(ComId, i32), CachedResponse>>,
 }
 
 impl JsonCache {
@@ -148,6 +182,7 @@ impl JsonCache {
 		JsonCache {
 			usage_cache: CachedResponse::new(),
 			score_cache: JsonScoreCache::new(),
+			leaderboard_cache: Mutex::new(HashMap::new()),
 		}
 	}
 }
@@ -291,11 +326,14 @@ impl StatServer {
 		info!("GameTracker::server_proc terminating");
 	}
 
-	fn handle_usage_req(cache_life: u32, game_tracker: &Arc<GameTracker>, json_cache: &Arc<JsonCache>) -> Result<Response<String>, Infallible> {
-		if cache_life == 0 {
+	fn handle_usage_req(cache_life: u32, game_tracker: &Arc<GameTracker>, json_cache: &Arc<JsonCache>, include_ips: bool) -> Result<Response<String>, Infallible> {
+		// The cache holds the public answer. An operator asking for addresses
+		// is rare and must not put them where the next caller would be served
+		// them, so that answer is built fresh and never stored.
+		if cache_life == 0 || include_ips {
 			return Ok(Response::builder()
 				.header("Content-Type", "application/json")
-				.body(StatServer::game_tracker_to_json(game_tracker))
+				.body(StatServer::game_tracker_to_json(game_tracker, include_ips))
 				.unwrap());
 		}
 
@@ -306,8 +344,12 @@ impl StatServer {
 		if is_stale {
 			*response = Response::builder()
 				.header("Content-Type", "application/json")
-				.body(StatServer::game_tracker_to_json(game_tracker))
+				.body(StatServer::game_tracker_to_json(game_tracker, false))
 				.unwrap();
+			// Without this the entry is stale on every request and the answer
+			// is rebuilt each time, which is the whole cost the cache exists
+			// to avoid.
+			json_cache.usage_cache.timestamp.store(new_timestamp, Ordering::SeqCst);
 		}
 
 		Ok((*response).clone())
@@ -395,6 +437,21 @@ impl StatServer {
 
 	fn json_response(status: StatusCode, body: String) -> Response<String> {
 		Response::builder().status(status).header("Content-Type", "application/json").body(body).unwrap()
+	}
+
+	/// Whether a request carries the operator API key.
+	///
+	/// Compared the same way as on the endpoints that require it. Used here to
+	/// decide how much of a response to fill in, not to allow or refuse a
+	/// request.
+	fn is_operator(req: &Request<hyper::body::Incoming>, external_user_api_key: &Option<String>) -> bool {
+		let Some(expected) = external_user_api_key else {
+			return false;
+		};
+		req.headers()
+			.get("X-API-Key")
+			.and_then(|value| value.to_str().ok())
+			.is_some_and(|value| value.len() == expected.len() && memcmp::eq(value.as_bytes(), expected.as_bytes()))
 	}
 
 	/// Sets one character's rank for an operator.
@@ -582,7 +639,41 @@ impl StatServer {
 		}
 	}
 
+	/// Entry point for the stat server.
+	///
+	/// Everything the routing below serves is meant to be readable by a page
+	/// in a browser, so the answers carry a permissive cross origin header.
+	/// Only the reading is opened up: a preflight is answered for GET alone
+	/// and does not allow `X-API-Key`, so the endpoints that take the operator
+	/// key stay reachable from a backend and not from someone else's page.
 	async fn handle_stat_server_req(
+		req: Request<hyper::body::Incoming>,
+		path: &str,
+		cache_life: u32,
+		game_tracker: Arc<GameTracker>,
+		score_cache: Arc<ScoresCache>,
+		json_cache: Arc<JsonCache>,
+		room_manager: Arc<RwLock<RoomManager>>,
+		db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+		external_user_api_key: Option<String>,
+	) -> Result<Response<String>, Infallible> {
+		if req.method() == Method::OPTIONS {
+			return Ok(Response::builder()
+				.status(StatusCode::NO_CONTENT)
+				.header("Access-Control-Allow-Origin", "*")
+				.header("Access-Control-Allow-Methods", "GET, OPTIONS")
+				.header("Access-Control-Allow-Headers", "Content-Type")
+				.header("Access-Control-Max-Age", "86400")
+				.body(String::new())
+				.unwrap());
+		}
+
+		let mut response = StatServer::route_stat_server_req(req, path, cache_life, game_tracker, score_cache, json_cache, room_manager, db_pool, external_user_api_key).await?;
+		response.headers_mut().insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
+		Ok(response)
+	}
+
+	async fn route_stat_server_req(
 		req: Request<hyper::body::Incoming>,
 		path: &str,
 		cache_life: u32,
@@ -619,9 +710,25 @@ impl StatServer {
 		let rooms_prefix = format!("{}/rooms/", path);
 		let matches_prefix = format!("{}/matches/", path);
 		let player_matches_prefix = format!("{}/players/", path);
+		let leaderboard_prefix = format!("{}/leaderboard/", path);
 
 		if req_path == usage_path {
-			return StatServer::handle_usage_req(cache_life, &game_tracker, &json_cache);
+			let include_ips = StatServer::is_operator(&req, &external_user_api_key);
+			return StatServer::handle_usage_req(cache_life, &game_tracker, &json_cache, include_ips);
+		}
+
+		// /leaderboard/<com_id>[?limit=n][&slot=n] : every account by rank
+		if let Some(rest) = req_path.strip_prefix(&leaderboard_prefix) {
+			if rest.len() == COMMUNICATION_ID_SIZE {
+				let mut com_id: ComId = [0u8; COMMUNICATION_ID_SIZE];
+				com_id.copy_from_slice(rest.as_bytes());
+				let query = req.uri().query();
+				// A whole population is a reasonable thing to ask for here,
+				// unlike a match list, so the ceiling is higher.
+				let limit = StatServer::parse_limit_with(query, 100, 10_000);
+				let slot = StatServer::query_param(query, "slot").and_then(|v| v.parse::<i32>().ok()).unwrap_or(1);
+				return StatServer::handle_leaderboard_req(&com_id, rest, slot, limit, cache_life, &json_cache, db_pool).await;
+			}
 		}
 
 		// /matches/<com_id>[?limit=n] : the most recent finished matches
@@ -680,7 +787,14 @@ impl StatServer {
 		Ok(Response::new("".to_owned()))
 	}
 
-	fn game_tracker_to_json(game_tracker: &Arc<GameTracker>) -> String {
+	/// The usage summary.
+	///
+	/// `include_ips` fills in each player's address, which the tracker holds
+	/// alongside their name. That is not something the game shows anyone, and
+	/// this endpoint has always been unauthenticated, so it is off unless the
+	/// caller presents the operator API key; the names are reported either
+	/// way, with a null in place of each address.
+	fn game_tracker_to_json(game_tracker: &Arc<GameTracker>, include_ips: bool) -> String {
 		let psn_games: Vec<(String, i64, Vec<String>)> = game_tracker
 			.psn_games
 			.read()
@@ -755,7 +869,11 @@ impl StatServer {
 				let players = game_info.players.read();
 				for (i, (name, ip)) in players.iter().enumerate() {
 					let comma = if i != players.len() - 1 { "," } else { "" };
-					let _ = write!(res, "            \"{}\": \"{}\"{}", sanitize_for_json(name), ip, comma);
+					if include_ips {
+						let _ = write!(res, "            \"{}\": \"{}\"{}", sanitize_for_json(name), ip, comma);
+					} else {
+						let _ = write!(res, "            \"{}\": null{}", sanitize_for_json(name), comma);
+					}
 					res += "\n";
 				}
 				res += if index != entries.len() - 1 { "        },\n" } else { "        }\n" };
@@ -813,9 +931,11 @@ impl StatServer {
 
 	/// `limit` query parameter, clamped so a caller cannot ask for everything.
 	fn parse_limit(query: Option<&str>) -> u32 {
-		const DEFAULT_LIMIT: u32 = 50;
-		const MAX_LIMIT: u32 = 500;
-		StatServer::query_param(query, "limit").and_then(|v| v.parse::<u32>().ok()).unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+		StatServer::parse_limit_with(query, 50, 500)
+	}
+
+	fn parse_limit_with(query: Option<&str>, default: u32, max: u32) -> u32 {
+		StatServer::query_param(query, "limit").and_then(|v| v.parse::<u32>().ok()).unwrap_or(default).clamp(1, max)
 	}
 
 	fn handle_recent_matches_req(com_id: &ComId, limit: u32, db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>) -> Result<Response<String>, Infallible> {
@@ -911,6 +1031,149 @@ impl StatServer {
 			Ok(json) => Ok(Response::builder().header("Content-Type", "application/json").body(json).unwrap()),
 			Err(_) => Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
 		}
+	}
+
+	/// Every account of a title ordered by its best character's rank.
+	///
+	/// Unauthenticated, like the other read endpoints: a rank is what the game
+	/// shows to everyone in a lobby anyway.
+	///
+	/// The ranks are not in any table - the title keeps them inside the save -
+	/// so this reads every save of the title. That is a few megabytes for a
+	/// population in the hundreds, but it is per request, so the result is
+	/// cached for `cache_life` seconds like the score tables.
+	async fn handle_leaderboard_req(
+		com_id: &ComId,
+		com_id_str: &str,
+		slot: i32,
+		limit: u32,
+		cache_life: u32,
+		json_cache: &Arc<JsonCache>,
+		db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+	) -> Result<Response<String>, Infallible> {
+		let new_timestamp = Client::get_timestamp_seconds();
+		let key = (*com_id, slot);
+
+		// Building a board reads one file per account, so unlike the other
+		// endpoints this one is never served uncached: a configuration that
+		// turns caching off would otherwise let any caller spend the whole
+		// population's worth of reads per request.
+		const MINIMUM_CACHE_LIFE: u32 = 30;
+		let cache_life = cache_life.max(MINIMUM_CACHE_LIFE);
+
+		// The cache holds the whole board; `limit` only trims the reply, so a
+		// different limit still hits the same entry. Never held across an
+		// await: the save reads below would be holding a blocking lock.
+		let fresh = {
+			let cache = json_cache.leaderboard_cache.lock();
+			cache
+				.get(&key)
+				.and_then(|cached| (new_timestamp <= cached.timestamp.load(Ordering::SeqCst) + cache_life).then(|| cached.cached_response.lock().body().clone()))
+		};
+		if let Some(body) = fresh {
+			return Ok(StatServer::trim_leaderboard(body, limit));
+		}
+
+		let owned_com_id = *com_id;
+		let listing = tokio::task::spawn_blocking(move || {
+			let connection = db_pool.get().map_err(|_| DbError::Internal)?;
+			let db = Database::new(connection);
+			let owners = db.tus_list_slot_owners(&owned_com_id, slot)?;
+			let tallies = db.get_match_tallies(&owned_com_id)?;
+			Ok::<_, DbError>((owners, tallies))
+		})
+		.await;
+
+		let (owners, tallies) = match listing {
+			Ok(Ok(found)) => found,
+			_ => return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
+		};
+
+		let mut ranked = Vec::with_capacity(owners.len());
+		let mut unreadable = 0usize;
+
+		for owner in owners {
+			let Ok(save) = Client::get_tus_data_file(owner.data_id).await else {
+				unreadable += 1;
+				continue;
+			};
+			let Ok(characters) = game_specific_tus::read_character_ranks(com_id, &save) else {
+				unreadable += 1;
+				continue;
+			};
+			let Some(best) = characters.iter().max_by_key(|c| (c.rank, c.rank_points)) else {
+				unreadable += 1;
+				continue;
+			};
+			let (wins, losses) = game_specific_tus::account_record(com_id, &save).unwrap_or((0, 0));
+			let (server_wins, server_losses) = tallies.get(&owner.user_id).copied().unwrap_or((0, 0));
+
+			ranked.push(LeaderboardEntry {
+				position: 0,
+				npid: owner.npid,
+				online_name: owner.online_name,
+				best_rank: best.rank,
+				best_rank_points: best.rank_points,
+				best_character: best.character,
+				record: PlayerRecord { wins, losses },
+				server_record: PlayerRecord {
+					wins: server_wins,
+					losses: server_losses,
+				},
+			});
+		}
+
+		// Ties are broken all the way down to the npid so that two requests
+		// that see the same data produce the same board.
+		ranked.sort_by(|a, b| {
+			b.best_rank
+				.cmp(&a.best_rank)
+				.then(b.best_rank_points.cmp(&a.best_rank_points))
+				.then(b.record.wins.cmp(&a.record.wins))
+				.then(a.npid.cmp(&b.npid))
+		});
+		for (index, entry) in ranked.iter_mut().enumerate() {
+			entry.position = index + 1;
+		}
+
+		let response = LeaderboardResponse {
+			com_id: com_id_str.to_owned(),
+			slot,
+			ranked_players: ranked.len(),
+			unreadable_saves: unreadable,
+			entries: ranked,
+		};
+
+		let Ok(json) = serde_json::to_string(&response) else {
+			return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned()));
+		};
+
+		{
+			let mut cache = json_cache.leaderboard_cache.lock();
+			let cached = cache.entry(key).or_insert_with(CachedResponse::new);
+			*cached.cached_response.lock() = Response::new(json.clone());
+			cached.timestamp.store(new_timestamp, Ordering::SeqCst);
+		}
+
+		Ok(StatServer::trim_leaderboard(json, limit))
+	}
+
+	/// Cuts a cached board down to the entries a request asked for.
+	///
+	/// The board is cached whole, so this re-reads it rather than keeping a
+	/// copy per limit. `ranked_players` stays the size of the whole board.
+	fn trim_leaderboard(json: String, limit: u32) -> Response<String> {
+		let parsed = serde_json::from_str::<serde_json::Value>(&json);
+		let trimmed = match parsed {
+			Ok(mut value) => {
+				if let Some(entries) = value.get_mut("entries").and_then(|e| e.as_array_mut()) {
+					entries.truncate(limit as usize);
+				}
+				serde_json::to_string(&value).unwrap_or(json)
+			}
+			Err(_) => json,
+		};
+		Response::builder().header("Content-Type", "application/json").body(trimmed).unwrap()
 	}
 
 	/// A query parameter, without pulling in a query string parser.

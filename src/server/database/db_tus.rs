@@ -14,6 +14,14 @@ pub struct DbTusDataStatus {
 	pub data_id: u64,
 }
 
+/// One account's claim on a TUS slot, without the save itself.
+pub struct DbTusSlotOwner {
+	pub user_id: i64,
+	pub npid: String,
+	pub online_name: String,
+	pub data_id: u64,
+}
+
 impl Database {
 	pub fn tus_get_all_data_ids(&self) -> Result<HashSet<u64>, DbError> {
 		let mut stmt = self.conn.prepare("SELECT data_id FROM tus_data").map_err(|_| DbError::Internal)?;
@@ -557,6 +565,42 @@ impl Database {
 					DbError::Internal
 				}
 			})
+	}
+
+	/// Every account that holds a save in one slot of one title.
+	///
+	/// What a leaderboard is built from: the ranks a title keeps live inside
+	/// the save rather than in any table, so ordering players by rank means
+	/// reading all of their saves. Banned accounts are left out.
+	pub fn tus_list_slot_owners(&self, com_id: &ComId, slot: i32) -> Result<Vec<DbTusSlotOwner>, DbError> {
+		let mut stmt = self
+			.conn
+			.prepare(
+				"SELECT t.owner_id, a.username, a.online_name, t.data_id FROM tus_data t 				 JOIN account a ON a.user_id = t.owner_id 				 WHERE t.communication_id = ?1 AND t.slot_id = ?2 AND a.banned = 0",
+			)
+			.map_err(|e| {
+				error!("Failed to prepare tus_list_slot_owners: {}", e);
+				DbError::Internal
+			})?;
+
+		let rows = stmt
+			.query_map(rusqlite::params![com_id, slot], |r| {
+				Ok(DbTusSlotOwner {
+					user_id: r.get(0)?,
+					npid: r.get(1)?,
+					online_name: r.get(2)?,
+					data_id: r.get(3)?,
+				})
+			})
+			.map_err(|e| {
+				error!("Failed to query tus_list_slot_owners: {}", e);
+				DbError::Internal
+			})?;
+
+		rows.collect::<Result<Vec<DbTusSlotOwner>, _>>().map_err(|e| {
+			error!("Failed to read a tus_list_slot_owners row: {}", e);
+			DbError::Internal
+		})
 	}
 
 	pub fn tus_get_user_data(&self, com_id: &ComId, user: i64, slot: i32) -> Result<(DbTusDataStatus, Vec<u8>), DbError> {
