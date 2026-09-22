@@ -83,6 +83,23 @@ struct AdminSetRankResponse {
 	data_id: u64,
 }
 
+#[derive(Serialize)]
+struct PlayerCharacterRank {
+	character: usize,
+	rank: u8,
+	rank_points: u16,
+}
+
+#[derive(Serialize)]
+struct PlayerRanksResponse {
+	npid: String,
+	online_name: String,
+	com_id: String,
+	slot: i32,
+	data_id: u64,
+	characters: Vec<PlayerCharacterRank>,
+}
+
 struct CachedResponse {
 	timestamp: AtomicU32,
 	cached_response: Mutex<Response<String>>,
@@ -613,6 +630,16 @@ impl StatServer {
 				let limit = StatServer::parse_limit(req.uri().query());
 				return StatServer::handle_player_matches_req(npid, limit, db_pool);
 			}
+
+			// /players/<npid>/ranks?com_id=...[&slot=n] : per character ranks
+			if let Some(npid) = rest.strip_suffix("/ranks") {
+				let query = req.uri().query();
+				let Some(com_id_str) = StatServer::query_param(query, "com_id") else {
+					return Ok(StatServer::json_response(StatusCode::BAD_REQUEST, "{\"error\":\"com_id_required\"}".to_owned()));
+				};
+				let slot = StatServer::query_param(query, "slot").and_then(|v| v.parse::<i32>().ok()).unwrap_or(1);
+				return StatServer::handle_player_ranks_req(npid, com_id_str, slot, db_pool).await;
+			}
 		}
 
 		if let Some(com_id_str) = req_path.strip_prefix(&rooms_prefix) {
@@ -778,10 +805,7 @@ impl StatServer {
 	fn parse_limit(query: Option<&str>) -> u32 {
 		const DEFAULT_LIMIT: u32 = 50;
 		const MAX_LIMIT: u32 = 500;
-		query
-			.and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("limit=")).and_then(|v| v.parse::<u32>().ok()))
-			.unwrap_or(DEFAULT_LIMIT)
-			.clamp(1, MAX_LIMIT)
+		StatServer::query_param(query, "limit").and_then(|v| v.parse::<u32>().ok()).unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 	}
 
 	fn handle_recent_matches_req(com_id: &ComId, limit: u32, db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>) -> Result<Response<String>, Infallible> {
@@ -813,6 +837,73 @@ impl StatServer {
 			Ok(matches) => Ok(Response::builder().header("Content-Type", "application/json").body(StatServer::matches_to_json(&matches)).unwrap()),
 			Err(_) => Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
 		}
+	}
+
+	/// One account's per character ranks, read out of the save it last wrote.
+	///
+	/// Unauthenticated, like the rooms and score endpoints: ranks are what the
+	/// game shows to everyone in a lobby anyway.
+	async fn handle_player_ranks_req(npid: &str, com_id_str: &str, slot: i32, db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>) -> Result<Response<String>, Infallible> {
+		if !Client::is_valid_client_username(npid) || com_id_str.len() != COMMUNICATION_ID_SIZE {
+			return Ok(StatServer::json_response(StatusCode::BAD_REQUEST, "{\"error\":\"invalid_request\"}".to_owned()));
+		}
+		let mut com_id: ComId = [0u8; COMMUNICATION_ID_SIZE];
+		com_id.copy_from_slice(com_id_str.as_bytes());
+
+		let owned_npid = npid.to_owned();
+		let lookup = tokio::task::spawn_blocking(move || {
+			let connection = db_pool.get().map_err(|_| DbError::Internal)?;
+			let db = Database::new(connection);
+			let user_id = db.get_user_id(&owned_npid)?;
+			let online_name = db.get_online_name(user_id)?;
+			let (status, _) = db.tus_get_user_data(&com_id, user_id, slot)?;
+			Ok::<_, DbError>((online_name, status.data_id))
+		})
+		.await;
+
+		let (online_name, data_id) = match lookup {
+			Ok(Ok(found)) => found,
+			Ok(Err(DbError::Empty)) => return Ok(StatServer::json_response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}".to_owned())),
+			_ => return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
+		};
+
+		let save = match Client::get_tus_data_file(data_id).await {
+			Ok(save) => save,
+			Err(_) => return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"save_unreadable\"}".to_owned())),
+		};
+
+		let characters = match game_specific_tus::read_character_ranks(&com_id, &save) {
+			Ok(characters) => characters,
+			Err(game_specific_tus::EditError::UnsupportedTitle) => {
+				return Ok(StatServer::json_response(StatusCode::BAD_REQUEST, "{\"error\":\"unsupported_title\"}".to_owned()));
+			}
+			Err(_) => return Ok(StatServer::json_response(StatusCode::CONFLICT, "{\"error\":\"malformed_save\"}".to_owned())),
+		};
+
+		let response = PlayerRanksResponse {
+			npid: npid.to_owned(),
+			online_name,
+			com_id: com_id_str.to_owned(),
+			slot,
+			data_id,
+			characters: characters
+				.into_iter()
+				.map(|c| PlayerCharacterRank {
+					character: c.character,
+					rank: c.rank,
+					rank_points: c.rank_points,
+				})
+				.collect(),
+		};
+		match serde_json::to_string(&response) {
+			Ok(json) => Ok(Response::builder().header("Content-Type", "application/json").body(json).unwrap()),
+			Err(_) => Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
+		}
+	}
+
+	/// A query parameter, without pulling in a query string parser.
+	fn query_param<'a>(query: Option<&'a str>, name: &str) -> Option<&'a str> {
+		query.and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix(name).and_then(|rest| rest.strip_prefix('='))))
 	}
 
 	fn matches_to_json(matches: &[DbMatchRecord]) -> String {

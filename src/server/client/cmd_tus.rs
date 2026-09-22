@@ -708,9 +708,9 @@ impl Client {
 			// rest of the roster when the account climbs into a new tier. Both
 			// need the save this one replaces to tell those apart, so read it
 			// back; there is no previous save for an account's first one.
-			let previous_save = match db.tus_get_user_data(&com_id, user_id, slot) {
-				Ok((status, _)) => Client::get_tus_data_file(status.data_id).await.ok(),
-				Err(DbError::Empty) => None,
+			let (superseded_id, previous_save) = match db.tus_get_user_data(&com_id, user_id, slot) {
+				Ok((status, _)) => (Some(status.data_id), Client::get_tus_data_file(status.data_id).await.ok()),
+				Err(DbError::Empty) => (None, None),
 				Err(_) => return Err(ErrorType::DbFail),
 			};
 			let floored_data = game_specific_tus::apply_rank_floor(&com_id, &tus_req.data, previous_save.as_deref());
@@ -725,6 +725,12 @@ impl Client {
 					// failure to record the history must not fail the request.
 					if let Err(e) = db.tus_record_data_history(&com_id, user_id, slot, data_id, new_timestamp) {
 						warn!("Failed to record tus data history for data_id {}: {:?}", data_id, e);
+					}
+					// The slot now points at the new save, so the one it
+					// replaced is unreachable. Left behind it would accumulate
+					// at the rate players save, until a restart swept it up.
+					if let Some(superseded_id) = superseded_id {
+						Client::delete_tus_data(superseded_id).await;
 					}
 					Ok(ErrorType::NoError)
 				}
