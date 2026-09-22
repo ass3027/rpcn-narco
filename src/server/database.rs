@@ -676,6 +676,14 @@ fn generate_string_from_slot_list(slot_list: &[i32]) -> String {
 	s
 }
 
+pub struct DbMatchRecord {
+	pub match_id: i64,
+	pub room_id: u64,
+	pub timestamp: u64,
+	pub npid_1: String,
+	pub npid_2: String,
+}
+
 impl Database {
 	pub fn new(conn: r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>) -> Database {
 		Database { conn }
@@ -1085,6 +1093,47 @@ impl Database {
 		}
 
 		Ok(res.unwrap())
+	}
+
+	/// A finished match as the stat server reports it.
+	pub fn get_recent_matches(&self, com_id: &ComId, limit: u32) -> Result<Vec<DbMatchRecord>, DbError> {
+		self.query_matches(
+			"SELECT m.match_id, m.room_id, m.timestamp, a1.username, a2.username FROM match_history m 			 JOIN account a1 ON a1.user_id = m.user_id_1 JOIN account a2 ON a2.user_id = m.user_id_2 			 WHERE m.communication_id = ?1 ORDER BY m.match_id DESC LIMIT ?2",
+			rusqlite::params![com_id, limit],
+		)
+	}
+
+	/// Every match the account took part in, whichever side it was stored on.
+	pub fn get_matches_for_user(&self, user_id: i64, limit: u32) -> Result<Vec<DbMatchRecord>, DbError> {
+		self.query_matches(
+			"SELECT m.match_id, m.room_id, m.timestamp, a1.username, a2.username FROM match_history m 			 JOIN account a1 ON a1.user_id = m.user_id_1 JOIN account a2 ON a2.user_id = m.user_id_2 			 WHERE m.user_id_1 = ?1 OR m.user_id_2 = ?1 ORDER BY m.match_id DESC LIMIT ?2",
+			rusqlite::params![user_id, limit],
+		)
+	}
+
+	fn query_matches(&self, query: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<DbMatchRecord>, DbError> {
+		let mut stmt = self.conn.prepare(query).map_err(|e| {
+			error!("Failed to prepare match history statement: {}", e);
+			DbError::Internal
+		})?;
+		let rows = stmt
+			.query_map(params, |row| {
+				Ok(DbMatchRecord {
+					match_id: row.get(0)?,
+					room_id: row.get(1)?,
+					timestamp: row.get(2)?,
+					npid_1: row.get(3)?,
+					npid_2: row.get(4)?,
+				})
+			})
+			.map_err(|e| {
+				error!("Failed to query match history: {}", e);
+				DbError::Internal
+			})?;
+		rows.collect::<Result<Vec<DbMatchRecord>, _>>().map_err(|e| {
+			error!("Failed to read a match history row: {}", e);
+			DbError::Internal
+		})
 	}
 
 	/// Records a finished two player match.

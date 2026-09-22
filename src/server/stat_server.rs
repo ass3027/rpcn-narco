@@ -11,7 +11,7 @@ use crate::server::GameTracker;
 use crate::server::Server;
 use crate::server::client::{COMMUNICATION_ID_SIZE, ComId, TerminateWatch, com_id_to_string};
 use crate::server::database::db_score::DbBoardInfo;
-use crate::server::database::{Database, DbError};
+use crate::server::database::{Database, DbError, DbMatchRecord};
 use crate::server::room_manager::RoomManager;
 use crate::server::score_cache::{GetScoreResultCache, ScoresCache};
 use http_body_util::{BodyExt, Limited};
@@ -410,9 +410,29 @@ impl StatServer {
 		let usage_path = format!("{}/usage", path);
 		let score_prefix = format!("{}/score/", path);
 		let rooms_prefix = format!("{}/rooms/", path);
+		let matches_prefix = format!("{}/matches/", path);
+		let player_matches_prefix = format!("{}/players/", path);
 
 		if req_path == usage_path {
 			return StatServer::handle_usage_req(cache_life, &game_tracker, &json_cache);
+		}
+
+		// /matches/<com_id>[?limit=n] : the most recent finished matches
+		if let Some(rest) = req_path.strip_prefix(&matches_prefix) {
+			if rest.len() == COMMUNICATION_ID_SIZE {
+				let mut com_id: ComId = [0u8; COMMUNICATION_ID_SIZE];
+				com_id.copy_from_slice(rest.as_bytes());
+				let limit = StatServer::parse_limit(req.uri().query());
+				return StatServer::handle_recent_matches_req(&com_id, limit, db_pool);
+			}
+		}
+
+		// /players/<npid>/matches[?limit=n] : one account's match history
+		if let Some(rest) = req_path.strip_prefix(&player_matches_prefix) {
+			if let Some(npid) = rest.strip_suffix("/matches") {
+				let limit = StatServer::parse_limit(req.uri().query());
+				return StatServer::handle_player_matches_req(npid, limit, db_pool);
+			}
 		}
 
 		if let Some(com_id_str) = req_path.strip_prefix(&rooms_prefix) {
@@ -571,6 +591,63 @@ impl StatServer {
 		}
 
 		res += "    ]\n}";
+		res
+	}
+
+	/// `limit` query parameter, clamped so a caller cannot ask for everything.
+	fn parse_limit(query: Option<&str>) -> u32 {
+		const DEFAULT_LIMIT: u32 = 50;
+		const MAX_LIMIT: u32 = 500;
+		query
+			.and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("limit=")).and_then(|v| v.parse::<u32>().ok()))
+			.unwrap_or(DEFAULT_LIMIT)
+			.clamp(1, MAX_LIMIT)
+	}
+
+	fn handle_recent_matches_req(com_id: &ComId, limit: u32, db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>) -> Result<Response<String>, Infallible> {
+		let conn = match db_pool.get() {
+			Ok(conn) => conn,
+			Err(_) => return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
+		};
+		match Database::new(conn).get_recent_matches(com_id, limit) {
+			Ok(matches) => Ok(Response::builder().header("Content-Type", "application/json").body(StatServer::matches_to_json(&matches)).unwrap()),
+			Err(_) => Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
+		}
+	}
+
+	fn handle_player_matches_req(npid: &str, limit: u32, db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>) -> Result<Response<String>, Infallible> {
+		if !Client::is_valid_client_username(npid) {
+			return Ok(StatServer::json_response(StatusCode::BAD_REQUEST, "{\"error\":\"invalid_npid\"}".to_owned()));
+		}
+		let conn = match db_pool.get() {
+			Ok(conn) => conn,
+			Err(_) => return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
+		};
+		let db = Database::new(conn);
+		let user_id = match db.get_user_id(npid) {
+			Ok(user_id) => user_id,
+			Err(DbError::Empty) => return Ok(StatServer::json_response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}".to_owned())),
+			Err(_) => return Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
+		};
+		match db.get_matches_for_user(user_id, limit) {
+			Ok(matches) => Ok(Response::builder().header("Content-Type", "application/json").body(StatServer::matches_to_json(&matches)).unwrap()),
+			Err(_) => Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
+		}
+	}
+
+	fn matches_to_json(matches: &[DbMatchRecord]) -> String {
+		let mut res = String::from("[\n");
+		for (index, m) in matches.iter().enumerate() {
+			// NPIDs are validated at account creation, but the sanitizer keeps
+			// this honest if that ever changes.
+			let _ = writeln!(res, "  {{");
+			let _ = writeln!(res, "    \"match_id\": {},", m.match_id);
+			let _ = writeln!(res, "    \"room_id\": {},", m.room_id);
+			let _ = writeln!(res, "    \"timestamp\": {},", m.timestamp);
+			let _ = writeln!(res, "    \"players\": [\"{}\", \"{}\"]", sanitize_for_json(&m.npid_1), sanitize_for_json(&m.npid_2));
+			res += if index != matches.len() - 1 { "  },\n" } else { "  }\n" };
+		}
+		res += "]";
 		res
 	}
 
