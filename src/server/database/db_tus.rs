@@ -505,6 +505,24 @@ impl Database {
 			})
 	}
 
+	/// Records that `data_id` was written for this slot.
+	///
+	/// `tus_data` is overwritten in place on every save, so this is the only
+	/// place the file to account association is kept. A failure here must not
+	/// fail the save itself, so the caller logs and carries on.
+	pub fn tus_record_data_history(&self, com_id: &ComId, user: i64, slot: i32, data_id: u64, timestamp: u64) -> Result<(), DbError> {
+		self.conn
+			.execute(
+				"INSERT OR IGNORE INTO tus_data_history ( data_id, owner_id, communication_id, slot_id, timestamp ) VALUES ( ?1, ?2, ?3, ?4, ?5 )",
+				rusqlite::params![data_id, user, com_id, slot, timestamp],
+			)
+			.map(|_| ())
+			.map_err(|e| {
+				error!("Unexpected error in tus_record_data_history: {}", e);
+				DbError::Internal
+			})
+	}
+
 	pub fn tus_set_vuser_data(
 		&self,
 		com_id: &ComId,

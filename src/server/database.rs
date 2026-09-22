@@ -102,7 +102,7 @@ struct MigrationData {
 
 static DATABASE_PATH: &str = "db/rpcn.db";
 
-static DATABASE_MIGRATIONS: [MigrationData; 11] = [
+static DATABASE_MIGRATIONS: [MigrationData; 12] = [
 	MigrationData {
 		version: 1,
 		text: "Initial setup",
@@ -158,7 +158,46 @@ static DATABASE_MIGRATIONS: [MigrationData; 11] = [
 		text: "Prepare tables for user deletion",
 		function: prepare_for_deletion,
 	},
+	MigrationData {
+		version: 12,
+		text: "Adding history tables for tus saves and finished matches",
+		function: add_history_tables,
+	},
 ];
+
+/// Two append only tables.
+///
+/// `tus_data_history` keeps one row per stored save. `tus_data` only ever
+/// holds the current `data_id` for a slot, so without this the association
+/// between a save file and the account that wrote it is lost as soon as the
+/// next save replaces it.
+///
+/// `match_history` keeps one row per finished two player room. The room
+/// manager already knows both participants when the room breaks up, but that
+/// is discarded today, so there is no record of who played whom.
+fn add_history_tables(conn: &r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>) -> Result<(), String> {
+	conn.execute(
+		"CREATE TABLE IF NOT EXISTS tus_data_history ( data_id UNSIGNED BIGINT PRIMARY KEY, owner_id UNSIGNED BIGINT NOT NULL, communication_id TEXT NOT NULL, slot_id INTEGER NOT NULL, timestamp UNSIGNED BIGINT NOT NULL )",
+		[],
+	)
+	.map_err(|e| format!("Failed to create tus_data_history table: {}", e))?;
+	conn.execute("CREATE INDEX IF NOT EXISTS tus_data_history_owner ON tus_data_history(owner_id)", [])
+		.map_err(|e| format!("Error creating tus_data_history_owner index: {}", e))?;
+
+	conn.execute(
+		"CREATE TABLE IF NOT EXISTS match_history ( match_id INTEGER PRIMARY KEY AUTOINCREMENT, communication_id TEXT NOT NULL, room_id UNSIGNED BIGINT NOT NULL, user_id_1 UNSIGNED BIGINT NOT NULL, user_id_2 UNSIGNED BIGINT NOT NULL, timestamp UNSIGNED BIGINT NOT NULL )",
+		[],
+	)
+	.map_err(|e| format!("Failed to create match_history table: {}", e))?;
+	conn.execute("CREATE INDEX IF NOT EXISTS match_history_user1 ON match_history(user_id_1)", [])
+		.map_err(|e| format!("Error creating match_history_user1 index: {}", e))?;
+	conn.execute("CREATE INDEX IF NOT EXISTS match_history_user2 ON match_history(user_id_2)", [])
+		.map_err(|e| format!("Error creating match_history_user2 index: {}", e))?;
+	conn.execute("CREATE INDEX IF NOT EXISTS match_history_time ON match_history(timestamp)", [])
+		.map_err(|e| format!("Error creating match_history_time index: {}", e))?;
+
+	Ok(())
+}
 
 fn initial_setup(conn: &r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>) -> Result<(), String> {
 	// user_id is actually used internally as u64(UNSIGNED BIGINT) but needs to be INTEGER for AUTOINCREMENT
@@ -1046,6 +1085,26 @@ impl Database {
 		}
 
 		Ok(res.unwrap())
+	}
+
+	/// Records a finished two player match.
+	///
+	/// Called once, when the room drops from two occupants to one, so a match
+	/// produces exactly one row regardless of which side leaves first. The
+	/// pair is stored with the lower user id first so that a match between two
+	/// accounts always looks the same whichever of them triggered the write.
+	pub fn record_match(&self, com_id: &ComId, room_id: u64, user_a: i64, user_b: i64, timestamp: u64) -> Result<(), DbError> {
+		let (low, high) = if user_a <= user_b { (user_a, user_b) } else { (user_b, user_a) };
+		self.conn
+			.execute(
+				"INSERT INTO match_history ( communication_id, room_id, user_id_1, user_id_2, timestamp ) VALUES ( ?1, ?2, ?3, ?4, ?5 )",
+				rusqlite::params![com_id, room_id, low, high, timestamp],
+			)
+			.map(|_| ())
+			.map_err(|e| {
+				error!("Unexpected error in record_match: {}", e);
+				DbError::Internal
+			})
 	}
 
 	pub fn get_user_id(&self, npid: &str) -> Result<i64, DbError> {
