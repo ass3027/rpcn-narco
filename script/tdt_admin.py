@@ -11,11 +11,11 @@ verifies the result by md5. Nothing here touches the database.
     tdt_admin.py backup <npid>... | --all [--label NAME]
     tdt_admin.py restore <npid> [--label NAME | --file PATH]
     tdt_admin.py list-backups [<npid>]
-    tdt_admin.py set-rank <npid> --char N --rank N [--points N]
-    tdt_admin.py set-account-rank <npid> --rank N
+    tdt_admin.py set-rank <npid> --char N --rank N|NAME [--points N]
+    tdt_admin.py set-account-rank <npid> --rank N|NAME
     tdt_admin.py apply <npid> --file PATH
-    tdt_admin.py floor <npid>... | --all [--rank N] [--label NAME]
-    tdt_admin.py floor --input-file X.tdt [<npid> | --output-file Y.tdt] [--rank N]
+    tdt_admin.py floor <npid>... | --all [--rank N|NAME] [--label NAME]
+    tdt_admin.py floor --input-file X.tdt [<npid> | --output-file Y.tdt] [--rank N|NAME]
     tdt_admin.py log [-n N]
     tdt_admin.py gc [--apply] [--archive] [--keep-days N]
 
@@ -296,6 +296,26 @@ def rank_name(code):
     return RANKS.get(code, (f"Unknown ({code})", "Unknown"))
 
 
+def _norm(s):
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+
+_RANK_BY_NAME = {_norm(name): code for code, (name, _) in RANKS.items()}
+
+
+def parse_rank(s):
+    """argparse type: a rank code or a rank name ('Genbu', 'tekken god', '1st dan')"""
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    code = _RANK_BY_NAME.get(_norm(s))
+    if code is None:
+        names = ", ".join(name for name, _ in RANKS.values())
+        raise argparse.ArgumentTypeError(f"unknown rank {s!r}. use a number or one of: {names}")
+    return code
+
+
 def decode(b, all_chars=False):
     chars = []
     for i in range(CHAR_N):
@@ -439,6 +459,8 @@ def cmd_set_rank(a):
 
 
 def cmd_set_account_rank(a):
+    if not 0 <= a.rank <= 255:
+        die("--rank must be 0..255")
     uid, data_id, saved, path = lookup(a.npid)
     b = read_save(path)
     old = b[OFF_ACCOUNT_RANK]
@@ -703,13 +725,13 @@ def main():
     s = sub.add_parser("set-rank")
     s.add_argument("npid")
     s.add_argument("--char", type=int, required=True)
-    s.add_argument("--rank", type=int, required=True)
+    s.add_argument("--rank", type=parse_rank, required=True)
     s.add_argument("--points", type=int)
     common(s); s.set_defaults(fn=cmd_set_rank)
 
     s = sub.add_parser("set-account-rank")
     s.add_argument("npid")
-    s.add_argument("--rank", type=int, required=True)
+    s.add_argument("--rank", type=parse_rank, required=True)
     common(s); s.set_defaults(fn=cmd_set_account_rank)
 
     s = sub.add_parser("apply")
@@ -720,7 +742,7 @@ def main():
     s = sub.add_parser("floor")
     s.add_argument("npid", nargs="*")
     s.add_argument("--all", action="store_true")
-    s.add_argument("--rank", type=int, help="floor rank to force (default: two tiers below reached)")
+    s.add_argument("--rank", type=parse_rank, help="floor rank, number or name (default: two tiers below reached)")
     s.add_argument("--input-file", "--file", dest="file",
                    help="floor this .tdt save file instead of the live one")
     s.add_argument("--output-file", "--out", dest="out",
