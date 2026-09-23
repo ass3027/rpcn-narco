@@ -8,7 +8,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-import read_tdt_ranks as tdt
+import tdt_admin as tdt
 
 
 def character_ids(value: str) -> tuple[int, ...]:
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_rank(path: Path, character_id: int) -> int:
-    offset = tdt.CHARACTER_RECORD_OFFSET + tdt.CHARACTER_RECORD_SIZE * character_id
+    offset = tdt.CHAR_BASE + tdt.CHAR_STRIDE * character_id
     with path.open("rb") as tdt_file:
         tdt_file.seek(offset)
         rank = tdt_file.read(1)

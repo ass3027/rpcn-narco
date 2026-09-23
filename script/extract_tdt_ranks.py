@@ -10,7 +10,20 @@ import sys
 import tarfile
 from pathlib import Path
 
-from read_tdt_ranks import print_table, read_ranks
+from tdt_admin import REC, decode
+
+
+def read_ranks(data: bytes) -> list[dict]:
+    if len(data) != REC:
+        raise ValueError(f"expected {REC} bytes, got {len(data)}")
+    return decode(bytearray(data), all_chars=True)["chars"]
+
+
+def print_table(rows: list[dict]) -> None:
+    print(f"{'ID':>2}  {'Character':<14} {'Rank':<18} Code")
+    print("--  -------------- ------------------ ----")
+    for row in rows:
+        print(f"{row['id']:>2}  {row['character']:<14} {row['rank_name']:<18} {row['rank']:>4}")
 
 
 TAG2_COMMUNICATION_ID = b"NPWR02973_00"
