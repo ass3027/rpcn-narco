@@ -102,7 +102,7 @@ struct MigrationData {
 
 static DATABASE_PATH: &str = "db/rpcn.db";
 
-static DATABASE_MIGRATIONS: [MigrationData; 11] = [
+static DATABASE_MIGRATIONS: [MigrationData; 13] = [
 	MigrationData {
 		version: 1,
 		text: "Initial setup",
@@ -158,7 +158,90 @@ static DATABASE_MIGRATIONS: [MigrationData; 11] = [
 		text: "Prepare tables for user deletion",
 		function: prepare_for_deletion,
 	},
+	MigrationData {
+		version: 12,
+		text: "Adding history tables for tus saves and finished matches",
+		function: add_history_tables,
+	},
+	MigrationData {
+		version: 13,
+		text: "Add rank floor tracking",
+		function: add_rank_floor_table,
+	},
 ];
+
+/// Two append only tables.
+///
+/// `tus_data_history` keeps one row per stored save: who wrote it, when, and
+/// what it said about the match before it. `tus_data` only ever holds the
+/// current `data_id` for a slot, so without this there is no record that the
+/// save happened at all once the next one replaces it.
+///
+/// It is an index, not a way back to the bytes. The file a row names is
+/// deleted as soon as the next save replaces it, and `clean_tus_data` sweeps
+/// anything `tus_data` no longer points at on the next restart.
+///
+/// `match_history` keeps one row per finished two player room. The room
+/// manager already knows both participants when the room breaks up, but that
+/// is discarded today, so there is no record of who played whom.
+///
+/// Neither table learns the result of a match directly: play is peer to peer
+/// and the title reports nothing about it. What it does report is the save it
+/// writes afterwards, whose running totals say whether the account won, so
+/// `tus_data_history.outcome` holds that reading and `match_history.winner_id`
+/// holds the match it was matched up with.
+fn add_history_tables(conn: &r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>) -> Result<(), String> {
+	conn.execute(
+		"CREATE TABLE IF NOT EXISTS tus_data_history ( data_id UNSIGNED BIGINT PRIMARY KEY, owner_id UNSIGNED BIGINT NOT NULL, communication_id TEXT NOT NULL, slot_id INTEGER NOT NULL, timestamp UNSIGNED BIGINT NOT NULL, outcome INTEGER, resolved_match_id INTEGER )",
+		[],
+	)
+	.map_err(|e| format!("Failed to create tus_data_history table: {}", e))?;
+	conn.execute("CREATE INDEX IF NOT EXISTS tus_data_history_owner ON tus_data_history(owner_id)", [])
+		.map_err(|e| format!("Error creating tus_data_history_owner index: {}", e))?;
+
+	conn.execute(
+		"CREATE TABLE IF NOT EXISTS match_history ( match_id INTEGER PRIMARY KEY AUTOINCREMENT, communication_id TEXT NOT NULL, room_id UNSIGNED BIGINT NOT NULL, user_id_1 UNSIGNED BIGINT NOT NULL, user_id_2 UNSIGNED BIGINT NOT NULL, timestamp UNSIGNED BIGINT NOT NULL, winner_id UNSIGNED BIGINT )",
+		[],
+	)
+	.map_err(|e| format!("Failed to create match_history table: {}", e))?;
+	conn.execute("CREATE INDEX IF NOT EXISTS match_history_user1 ON match_history(user_id_1)", [])
+		.map_err(|e| format!("Error creating match_history_user1 index: {}", e))?;
+	conn.execute("CREATE INDEX IF NOT EXISTS match_history_user2 ON match_history(user_id_2)", [])
+		.map_err(|e| format!("Error creating match_history_user2 index: {}", e))?;
+	conn.execute("CREATE INDEX IF NOT EXISTS match_history_time ON match_history(timestamp)", [])
+		.map_err(|e| format!("Error creating match_history_time index: {}", e))?;
+
+	// Pairing a match up with the save that reports its result looks up
+	// unresolved rows on both sides, so both want an index.
+	conn.execute("CREATE INDEX IF NOT EXISTS tus_data_history_pending ON tus_data_history(owner_id, resolved_match_id)", [])
+		.map_err(|e| format!("Error creating tus_data_history_pending index: {}", e))?;
+	conn.execute("CREATE INDEX IF NOT EXISTS match_history_pending ON match_history(winner_id)", [])
+		.map_err(|e| format!("Error creating match_history_pending index: {}", e))?;
+
+	Ok(())
+}
+
+/// What the server has already done to a slot's ranks.
+///
+/// A title whose ranks are raised at a tier crossing has to know that the
+/// crossing happened. It cannot be read off the saves: the client holds its
+/// own copy for a whole session and writes it back after every match without
+/// fetching, so a raise the server makes is absent from the client's next
+/// save and comparing the two would read the crossing as already handled.
+///
+/// `delivered` records whether the client has fetched the slot since the
+/// floor was applied. Until it has, every save it sends was written in
+/// ignorance of the raise, so the raise is applied again; afterwards the
+/// player has it and a demotion below the floor is theirs to keep.
+fn add_rank_floor_table(conn: &r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>) -> Result<(), String> {
+	conn.execute(
+		"CREATE TABLE IF NOT EXISTS tus_rank_floor ( owner_id UNSIGNED BIGINT NOT NULL, communication_id TEXT NOT NULL, slot_id INTEGER NOT NULL, floor INTEGER NOT NULL, delivered BOOL NOT NULL, PRIMARY KEY ( owner_id, communication_id, slot_id ) )",
+		[],
+	)
+	.map_err(|e| format!("Failed to create tus_rank_floor table: {}", e))?;
+
+	Ok(())
+}
 
 fn initial_setup(conn: &r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>) -> Result<(), String> {
 	// user_id is actually used internally as u64(UNSIGNED BIGINT) but needs to be INTEGER for AUTOINCREMENT
@@ -637,6 +720,17 @@ fn generate_string_from_slot_list(slot_list: &[i32]) -> String {
 	s
 }
 
+pub struct DbMatchRecord {
+	pub match_id: i64,
+	pub room_id: u64,
+	pub timestamp: u64,
+	pub npid_1: String,
+	pub npid_2: String,
+	/// The winner, when the result was recovered from a save written
+	/// afterwards. `None` means the match is unresolved, not a draw.
+	pub winner_npid: Option<String>,
+}
+
 impl Database {
 	pub fn new(conn: r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>) -> Database {
 		Database { conn }
@@ -923,6 +1017,28 @@ impl Database {
 			return Err(DbError::Internal);
 		}
 
+		// The history tables follow the same convention as the ones above: the
+		// rows stay and point at the deleted user, so a match one side of which
+		// has left still lists and still counts the same way.
+		for (table, column) in [
+			("tus_data_history", "owner_id"),
+			("match_history", "user_id_1"),
+			("match_history", "user_id_2"),
+			("match_history", "winner_id"),
+		] {
+			let query = format!("UPDATE {} SET {} = ?1 WHERE {} = ?2", table, column, column);
+			if let Err(e) = self.conn.execute(&query, rusqlite::params![deleted_userid, user_id]) {
+				error!("Unexpected error updating deleted user in {}.{}: {}", table, column, e);
+				return Err(DbError::Internal);
+			}
+		}
+
+		// Nothing to carry over: the floor describes a save this account owned.
+		if let Err(e) = self.conn.execute("DELETE FROM tus_rank_floor WHERE owner_id = ?1", rusqlite::params![user_id]) {
+			error!("Unexpected error deleting the rank floor of a deleted user: {}", e);
+			return Err(DbError::Internal);
+		}
+
 		if let Err(e) = self.conn.execute("DELETE FROM account WHERE user_id = ?1", rusqlite::params![user_id]) {
 			error!("Unexpected error deleting user from account: {}", e);
 			return Err(DbError::Internal);
@@ -1048,6 +1164,271 @@ impl Database {
 		Ok(res.unwrap())
 	}
 
+	/// Won and lost counts per account, from the matches the server resolved.
+	///
+	/// This is the server's own tally, which is not the same as the record the
+	/// title keeps: it counts only matches played here and only those whose
+	/// result was recovered. Reported alongside the title's own numbers rather
+	/// than in place of them.
+	pub fn get_match_tallies(&self, com_id: &ComId) -> Result<HashMap<i64, (u32, u32)>, DbError> {
+		let mut stmt = self
+			.conn
+			.prepare("SELECT user_id_1, user_id_2, winner_id FROM match_history 				 WHERE communication_id = ?1 AND winner_id IS NOT NULL")
+			.map_err(|e| {
+				error!("Failed to prepare match tally statement: {}", e);
+				DbError::Internal
+			})?;
+
+		let rows = stmt
+			.query_map(rusqlite::params![com_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+			.map_err(|e| {
+				error!("Failed to query match tallies: {}", e);
+				DbError::Internal
+			})?;
+
+		let mut tallies: HashMap<i64, (u32, u32)> = HashMap::new();
+		for row in rows {
+			let (user_id_1, user_id_2, winner_id) = row.map_err(|e| {
+				error!("Failed to read a match tally row: {}", e);
+				DbError::Internal
+			})?;
+			for user in [user_id_1, user_id_2] {
+				let entry = tallies.entry(user).or_insert((0, 0));
+				if user == winner_id { entry.0 += 1 } else { entry.1 += 1 }
+			}
+		}
+
+		Ok(tallies)
+	}
+
+	/// A finished match as the stat server reports it.
+	pub fn get_recent_matches(&self, com_id: &ComId, limit: u32) -> Result<Vec<DbMatchRecord>, DbError> {
+		self.query_matches(
+			"SELECT m.match_id, m.room_id, m.timestamp, a1.username, a2.username, aw.username FROM match_history m 			 JOIN account a1 ON a1.user_id = m.user_id_1 JOIN account a2 ON a2.user_id = m.user_id_2 			 LEFT JOIN account aw ON aw.user_id = m.winner_id 			 WHERE m.communication_id = ?1 ORDER BY m.match_id DESC LIMIT ?2",
+			rusqlite::params![com_id, limit],
+		)
+	}
+
+	/// Every match the account took part in, whichever side it was stored on.
+	pub fn get_matches_for_user(&self, user_id: i64, limit: u32) -> Result<Vec<DbMatchRecord>, DbError> {
+		self.query_matches(
+			"SELECT m.match_id, m.room_id, m.timestamp, a1.username, a2.username, aw.username FROM match_history m 			 JOIN account a1 ON a1.user_id = m.user_id_1 JOIN account a2 ON a2.user_id = m.user_id_2 			 LEFT JOIN account aw ON aw.user_id = m.winner_id 			 WHERE m.user_id_1 = ?1 OR m.user_id_2 = ?1 ORDER BY m.match_id DESC LIMIT ?2",
+			rusqlite::params![user_id, limit],
+		)
+	}
+
+	fn query_matches(&self, query: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<DbMatchRecord>, DbError> {
+		let mut stmt = self.conn.prepare(query).map_err(|e| {
+			error!("Failed to prepare match history statement: {}", e);
+			DbError::Internal
+		})?;
+		let rows = stmt
+			.query_map(params, |row| {
+				Ok(DbMatchRecord {
+					match_id: row.get(0)?,
+					room_id: row.get(1)?,
+					timestamp: row.get(2)?,
+					npid_1: row.get(3)?,
+					npid_2: row.get(4)?,
+					winner_npid: row.get(5)?,
+				})
+			})
+			.map_err(|e| {
+				error!("Failed to query match history: {}", e);
+				DbError::Internal
+			})?;
+		rows.collect::<Result<Vec<DbMatchRecord>, _>>().map_err(|e| {
+			error!("Failed to read a match history row: {}", e);
+			DbError::Internal
+		})
+	}
+
+	/// Records a finished two player match.
+	///
+	/// Called once, when the room drops from two occupants to one, so a match
+	/// produces exactly one row regardless of which side leaves first. The
+	/// pair is stored with the lower user id first so that a match between two
+	/// accounts always looks the same whichever of them triggered the write.
+	pub fn record_match(&self, com_id: &ComId, room_id: u64, user_a: i64, user_b: i64, timestamp: u64) -> Result<(), DbError> {
+		let (low, high) = if user_a <= user_b { (user_a, user_b) } else { (user_b, user_a) };
+		self.conn
+			.execute(
+				"INSERT INTO match_history ( communication_id, room_id, user_id_1, user_id_2, timestamp ) VALUES ( ?1, ?2, ?3, ?4, ?5 )",
+				rusqlite::params![com_id, room_id, low, high, timestamp],
+			)
+			.map_err(|e| {
+				error!("Unexpected error in record_match: {}", e);
+				DbError::Internal
+			})?;
+
+		let match_id = self.conn.last_insert_rowid();
+
+		// The title may have written its save before the room broke up, in
+		// which case the result is already waiting to be claimed.
+		for user in [low, high] {
+			if let Err(e) = self.claim_pending_outcome(com_id, match_id, low, high, user, timestamp) {
+				warn!("Failed to claim a pending match outcome for user {}: {:?}", user, e);
+			}
+		}
+
+		Ok(())
+	}
+
+	/// How long after a room breaks up a save may still be taken to be
+	/// reporting on it. PSN timestamps are microseconds, so this is 30
+	/// seconds.
+	///
+	/// It has to be shorter than a match, because the two events arrive in
+	/// either order. When the save comes first its own match is not recorded
+	/// yet, so the most recent match on file is the *previous* one, and a
+	/// window wide enough to reach it writes this result onto that. A window
+	/// under one match length cannot reach back that far, and the save waits
+	/// for `claim_pending_outcome` instead. Simulated over both orders with
+	/// back to back rematches and a fifth of matches never reported: 30
+	/// seconds misattributes none, 60 seconds misattributes some.
+	const SAVE_WINDOW: u64 = 30 * 1_000_000;
+
+	/// How far back a freshly recorded match looks for a save already waiting
+	/// to be claimed. Generous, because such a save is consumed once and is
+	/// only ever claimed by a match the account actually played.
+	const CLAIM_WINDOW: u64 = 10 * 60 * 1_000_000;
+
+	/// Attaches a result read out of a save to the match it belongs to.
+	///
+	/// Called from the save side, where the account has just reported one more
+	/// win or one more loss than its previous save. The match it belongs to is
+	/// the most recent one the account took part in *and has not already
+	/// reported on* - one result save per player per match - which is in one
+	/// of three states:
+	///
+	/// - unresolved, so this save names its winner;
+	/// - already resolved, and agreeing with this save, because the opponent
+	///   reported first - there is nothing left to do but spend the save;
+	/// - already resolved and disagreeing, which means the match this save is
+	///   reporting on is one the room has not finished breaking up yet. The
+	///   reading stays on the save for `claim_pending_outcome`.
+	///
+	/// The third case is also what a first-ever match looks like, where there
+	/// is no previous match at all.
+	///
+	/// That the account cannot report on the same match twice is what keeps
+	/// this honest when a save arrives before the room has broken up, which
+	/// happens either way round in practice: without it a save would attach
+	/// itself to whatever older match of the account's was still unresolved.
+	///
+	/// Returns the match it resolved, if any.
+	pub fn resolve_match_outcome(&self, com_id: &ComId, user_id: i64, data_id: u64, won: bool, timestamp: u64) -> Result<Option<i64>, DbError> {
+		let floor = timestamp.saturating_sub(Self::SAVE_WINDOW);
+
+		// Only ever the single most recent match, and only of this title: a
+		// room is recorded for every game, and reaching past the newest match
+		// is how a result lands on the wrong one.
+		let found: rusqlite::Result<(i64, Option<i64>, i64, i64, bool)> = self.conn.query_row(
+			"SELECT m.match_id, m.winner_id, m.user_id_1, m.user_id_2, 			 EXISTS ( SELECT 1 FROM tus_data_history h WHERE h.owner_id = ?1 AND h.resolved_match_id = m.match_id ) 			 FROM match_history m WHERE m.communication_id = ?2 AND ( m.user_id_1 = ?1 OR m.user_id_2 = ?1 ) AND m.timestamp >= ?3 			 ORDER BY m.match_id DESC LIMIT 1",
+			rusqlite::params![user_id, com_id, floor],
+			|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+		);
+
+		let (match_id, winner_id, user_id_1, user_id_2, already_reported) = match found {
+			Ok(row) => row,
+			Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+			Err(e) => {
+				error!("Unexpected error looking for a match to resolve: {}", e);
+				return Err(DbError::Internal);
+			}
+		};
+
+		// The account has already spoken about this one, so this save is
+		// reporting on a match the room has not finished breaking up yet.
+		if already_reported {
+			return Ok(None);
+		}
+
+		let expected = if won {
+			user_id
+		} else if user_id_1 == user_id {
+			user_id_2
+		} else {
+			user_id_1
+		};
+
+		match winner_id {
+			None => {
+				self.write_winner(match_id, expected, data_id)?;
+				Ok(Some(match_id))
+			}
+			// The opponent got here first and said the same thing.
+			Some(existing) if existing == expected => {
+				self.spend_outcome(match_id, data_id)?;
+				Ok(Some(match_id))
+			}
+			// This save is reporting on a match that is not in the table yet.
+			Some(_) => Ok(None),
+		}
+	}
+
+	/// The other direction: a match has just been recorded and the save
+	/// reporting its result had already arrived.
+	fn claim_pending_outcome(&self, com_id: &ComId, match_id: i64, user_id_1: i64, user_id_2: i64, user_id: i64, timestamp: u64) -> Result<(), DbError> {
+		let floor = timestamp.saturating_sub(Self::CLAIM_WINDOW);
+
+		let found: rusqlite::Result<(u64, i64)> = self.conn.query_row(
+			"SELECT data_id, outcome FROM tus_data_history WHERE owner_id = ?1 AND communication_id = ?2 AND outcome IS NOT NULL AND resolved_match_id IS NULL AND timestamp >= ?3 ORDER BY data_id DESC LIMIT 1",
+			rusqlite::params![user_id, com_id, floor],
+			|r| Ok((r.get(0)?, r.get(1)?)),
+		);
+
+		match found {
+			Ok((data_id, outcome)) => {
+				let won = outcome != 0;
+				let expected = if won {
+					user_id
+				} else if user_id_1 == user_id {
+					user_id_2
+				} else {
+					user_id_1
+				};
+				self.write_winner(match_id, expected, data_id)
+			}
+			Err(rusqlite::Error::QueryReturnedNoRows) => Ok(()),
+			Err(e) => {
+				error!("Unexpected error looking for a pending match outcome: {}", e);
+				Err(DbError::Internal)
+			}
+		}
+	}
+
+	/// Names the winner of a match and spends the save that said so.
+	///
+	/// Only ever writes a winner that is still unset, so of the two
+	/// participants - who report the same winner - whichever arrives second
+	/// changes nothing.
+	fn write_winner(&self, match_id: i64, winner_id: i64, data_id: u64) -> Result<(), DbError> {
+		self.conn
+			.execute(
+				"UPDATE match_history SET winner_id = ?1 WHERE match_id = ?2 AND winner_id IS NULL",
+				rusqlite::params![winner_id, match_id],
+			)
+			.map_err(|e| {
+				error!("Unexpected error writing a match winner: {}", e);
+				DbError::Internal
+			})?;
+
+		self.spend_outcome(match_id, data_id)
+	}
+
+	/// Ties a save's reading to the match it accounted for, so it cannot go on
+	/// to resolve a second one.
+	fn spend_outcome(&self, match_id: i64, data_id: u64) -> Result<(), DbError> {
+		self.conn
+			.execute("UPDATE tus_data_history SET resolved_match_id = ?1 WHERE data_id = ?2", rusqlite::params![match_id, data_id])
+			.map_err(|e| {
+				error!("Unexpected error marking a match outcome as spent: {}", e);
+				DbError::Internal
+			})
+			.map(|_| ())
+	}
+
 	pub fn get_user_id(&self, npid: &str) -> Result<i64, DbError> {
 		let res: rusqlite::Result<i64> = self
 			.conn
@@ -1063,6 +1444,20 @@ impl Database {
 		}
 
 		Ok(res.unwrap())
+	}
+
+	/// The name the account plays under, which is what the game tracker keys
+	/// its list of connected players by.
+	pub fn get_online_name(&self, user_id: i64) -> Result<String, DbError> {
+		self.conn
+			.query_row("SELECT online_name FROM account WHERE user_id = ?1", rusqlite::params![user_id], |r| r.get(0))
+			.map_err(|e| match e {
+				rusqlite::Error::QueryReturnedNoRows => DbError::Empty,
+				e => {
+					error!("Unexpected error querying online_name: {}", e);
+					DbError::Internal
+				}
+			})
 	}
 
 	pub fn get_username(&self, user_id: i64) -> Result<String, DbError> {

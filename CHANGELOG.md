@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Added
+
+- Per character ranks for a title whose save layout is known: a starting rank for a brand new account, and a floor for the rest of the roster when the account's best character crosses into a new rank tier
+- A history of stored TUS saves, so a save file can still be attributed to an account after the next save replaces it
+- A history of finished two player matches, recorded when the room breaks up
+- Stat server endpoints for finished matches and for an account's per character ranks
+- An authenticated stat server endpoint for an operator to correct a character's rank
+- Match results, recovered from the running record in the save an account uploads after a match, since nothing reports the result of a peer to peer match directly
+- A leaderboard endpoint ordering every account of a title by its best character's rank
+- `Access-Control-Allow-Origin` on stat server responses, so the read endpoints can be called from a browser
+
+### Changed
+
+- A TUS save that replaces another now deletes the one it replaced, instead of leaving it for the next restart to sweep up
+- The usage endpoint no longer reports players' IP addresses to unauthenticated callers, which it did alongside their names
+- The rank floor is now tracked by the server rather than inferred from consecutive saves, because a client writes back its own copy for a whole session and a raise made between its fetches was undone by its next save
+
+### Fixed
+
+- The usage endpoint's cache was stale on every request, so the response was rebuilt each time rather than once per `StatServerCacheLife`
+
 ## [1.8.5] - 2026-02-11
 ### Added
 

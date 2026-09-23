@@ -14,6 +14,14 @@ pub struct DbTusDataStatus {
 	pub data_id: u64,
 }
 
+/// One account's claim on a TUS slot, without the save itself.
+pub struct DbTusSlotOwner {
+	pub user_id: i64,
+	pub npid: String,
+	pub online_name: String,
+	pub data_id: u64,
+}
+
 impl Database {
 	pub fn tus_get_all_data_ids(&self) -> Result<HashSet<u64>, DbError> {
 		let mut stmt = self.conn.prepare("SELECT data_id FROM tus_data").map_err(|_| DbError::Internal)?;
@@ -505,6 +513,28 @@ impl Database {
 			})
 	}
 
+	/// Records that `data_id` was written for this slot.
+	///
+	/// `tus_data` is overwritten in place on every save, so this is the only
+	/// place the file to account association is kept. A failure here must not
+	/// fail the save itself, so the caller logs and carries on.
+	/// `outcome` is what the save says about the match that preceded it, where
+	/// the title stores enough to tell: `Some(true)` for a win, `Some(false)`
+	/// for a loss, `None` when the save did not follow a match or the title is
+	/// one nothing is known about.
+	pub fn tus_record_data_history(&self, com_id: &ComId, user: i64, slot: i32, data_id: u64, timestamp: u64, outcome: Option<bool>) -> Result<(), DbError> {
+		self.conn
+			.execute(
+				"INSERT OR IGNORE INTO tus_data_history ( data_id, owner_id, communication_id, slot_id, timestamp, outcome ) VALUES ( ?1, ?2, ?3, ?4, ?5, ?6 )",
+				rusqlite::params![data_id, user, com_id, slot, timestamp, outcome.map(|won| if won { 1 } else { 0 })],
+			)
+			.map(|_| ())
+			.map_err(|e| {
+				error!("Unexpected error in tus_record_data_history: {}", e);
+				DbError::Internal
+			})
+	}
+
 	pub fn tus_set_vuser_data(
 		&self,
 		com_id: &ComId,
@@ -535,6 +565,108 @@ impl Database {
 					DbError::Internal
 				}
 			})
+	}
+
+	/// What floor this slot has already been held to, and whether the client
+	/// has fetched the save since. Absent for a slot never held to one.
+	pub fn tus_get_rank_floor(&self, com_id: &ComId, user: i64, slot: i32) -> Result<Option<(u8, bool)>, DbError> {
+		let res: rusqlite::Result<(u8, bool)> = self.conn.query_row(
+			"SELECT floor, delivered FROM tus_rank_floor WHERE owner_id = ?1 AND communication_id = ?2 AND slot_id = ?3",
+			rusqlite::params![user, com_id, slot],
+			|r| Ok((r.get(0)?, r.get(1)?)),
+		);
+
+		match res {
+			Ok(found) => Ok(Some(found)),
+			Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+			Err(e) => {
+				error!("Unexpected error in tus_get_rank_floor: {}", e);
+				Err(DbError::Internal)
+			}
+		}
+	}
+
+	/// Records the floor a slot is now held to.
+	pub fn tus_set_rank_floor(&self, com_id: &ComId, user: i64, slot: i32, floor: u8, delivered: bool) -> Result<(), DbError> {
+		self.conn
+			.execute(
+				"INSERT INTO tus_rank_floor ( owner_id, communication_id, slot_id, floor, delivered ) VALUES ( ?1, ?2, ?3, ?4, ?5 ) 				 ON CONFLICT ( owner_id, communication_id, slot_id ) DO UPDATE SET floor = ?4, delivered = ?5",
+				rusqlite::params![user, com_id, slot, floor, delivered],
+			)
+			.map(|_| ())
+			.map_err(|e| {
+				error!("Unexpected error in tus_set_rank_floor: {}", e);
+				DbError::Internal
+			})
+	}
+
+	/// Forgets what a slot was held to, for when its save is deleted. Without
+	/// this a fresh save is read as one already held to the recorded floor and
+	/// is left without its starting rank.
+	pub fn tus_clear_rank_floor(&self, com_id: &ComId, user: i64, slots: &[i32]) -> Result<(), DbError> {
+		for slot in slots {
+			self.conn
+				.execute(
+					"DELETE FROM tus_rank_floor WHERE owner_id = ?1 AND communication_id = ?2 AND slot_id = ?3",
+					rusqlite::params![user, com_id, slot],
+				)
+				.map_err(|e| {
+					error!("Unexpected error in tus_clear_rank_floor: {}", e);
+					DbError::Internal
+				})?;
+		}
+		Ok(())
+	}
+
+	/// Notes that the client now has the raised save, which is the point from
+	/// which a demotion below the floor is the player's own.
+	pub fn tus_mark_rank_floor_delivered(&self, com_id: &ComId, user: i64, slot: i32) -> Result<(), DbError> {
+		self.conn
+			.execute(
+				"UPDATE tus_rank_floor SET delivered = 1 WHERE owner_id = ?1 AND communication_id = ?2 AND slot_id = ?3 AND delivered = 0",
+				rusqlite::params![user, com_id, slot],
+			)
+			.map(|_| ())
+			.map_err(|e| {
+				error!("Unexpected error in tus_mark_rank_floor_delivered: {}", e);
+				DbError::Internal
+			})
+	}
+
+	/// Every account that holds a save in one slot of one title.
+	///
+	/// What a leaderboard is built from: the ranks a title keeps live inside
+	/// the save rather than in any table, so ordering players by rank means
+	/// reading all of their saves. Banned accounts are left out.
+	pub fn tus_list_slot_owners(&self, com_id: &ComId, slot: i32) -> Result<Vec<DbTusSlotOwner>, DbError> {
+		let mut stmt = self
+			.conn
+			.prepare(
+				"SELECT t.owner_id, a.username, a.online_name, t.data_id FROM tus_data t 				 JOIN account a ON a.user_id = t.owner_id 				 WHERE t.communication_id = ?1 AND t.slot_id = ?2 AND a.banned = 0",
+			)
+			.map_err(|e| {
+				error!("Failed to prepare tus_list_slot_owners: {}", e);
+				DbError::Internal
+			})?;
+
+		let rows = stmt
+			.query_map(rusqlite::params![com_id, slot], |r| {
+				Ok(DbTusSlotOwner {
+					user_id: r.get(0)?,
+					npid: r.get(1)?,
+					online_name: r.get(2)?,
+					data_id: r.get(3)?,
+				})
+			})
+			.map_err(|e| {
+				error!("Failed to query tus_list_slot_owners: {}", e);
+				DbError::Internal
+			})?;
+
+		rows.collect::<Result<Vec<DbTusSlotOwner>, _>>().map_err(|e| {
+			error!("Failed to read a tus_list_slot_owners row: {}", e);
+			DbError::Internal
+		})
 	}
 
 	pub fn tus_get_user_data(&self, com_id: &ComId, user: i64, slot: i32) -> Result<(DbTusDataStatus, Vec<u8>), DbError> {

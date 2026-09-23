@@ -2,10 +2,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use prost::Message;
 use tokio::fs;
+use tracing::debug;
 
 use crate::server::Server;
 use crate::server::client::*;
 use crate::server::database::DbError;
+use crate::server::game_specific_tus;
 
 const TUS_DATA_DIRECTORY: &str = "tus_data";
 const TUS_FILE_EXTENSION: &str = "tdt";
@@ -79,7 +81,7 @@ impl Client {
 		format!("{}/{:020}.{}", TUS_DATA_DIRECTORY, id, TUS_FILE_EXTENSION)
 	}
 
-	async fn create_tus_data_file(data: &[u8]) -> u64 {
+	pub(crate) async fn create_tus_data_file(data: &[u8]) -> u64 {
 		let id = TUS_DATA_ID_DISPENSER.fetch_add(1, Ordering::SeqCst);
 		let path = Client::tus_id_to_path(id);
 
@@ -98,7 +100,7 @@ impl Client {
 		id
 	}
 
-	async fn get_tus_data_file(id: u64) -> Result<Vec<u8>, ErrorType> {
+	pub(crate) async fn get_tus_data_file(id: u64) -> Result<Vec<u8>, ErrorType> {
 		let path = Client::tus_id_to_path(id);
 
 		fs::read(&path).await.map_err(|e| {
@@ -704,11 +706,75 @@ impl Client {
 				return ret_value;
 			}
 
-			let data_id = Client::create_tus_data_file(&tus_req.data).await;
+			// Some titles place a new account at a starting rank, and raise the
+			// rest of the roster when the account climbs into a new tier. Both
+			// need the save this one replaces to tell those apart, so read it
+			// back; there is no previous save for an account's first one.
+			let (superseded_id, previous_save) = match db.tus_get_user_data(&com_id, user_id, slot) {
+				Ok((status, _)) => (Some(status.data_id), Client::get_tus_data_file(status.data_id).await.ok()),
+				Err(DbError::Empty) => (None, None),
+				Err(_) => return Err(ErrorType::DbFail),
+			};
+			// The crossing is read from what the server recorded, not from the
+			// saves: the client writes back its own copy for a whole session
+			// without fetching, so the previous save is not evidence of what
+			// the player has actually been given.
+			let floor_state = match db.tus_get_rank_floor(&com_id, user_id, slot) {
+				Ok(Some((applied, delivered))) => game_specific_tus::FloorState { applied: Some(applied), delivered },
+				Ok(None) => game_specific_tus::FloorState::default(),
+				Err(_) => return Err(ErrorType::DbFail),
+			};
+			let floored = game_specific_tus::apply_rank_floor(&com_id, &tus_req.data, floor_state);
+			let data_to_store: &[u8] = floored.as_ref().and_then(|f| f.data.as_deref()).unwrap_or(&tus_req.data);
+
+			// The same pair of saves says how the match that preceded them
+			// went, for a title that keeps a running record. Read it off the
+			// data the client sent rather than the data being stored, so an
+			// edit made above can never look like a result.
+			let outcome = previous_save
+				.as_deref()
+				.and_then(|previous| game_specific_tus::match_outcome(&com_id, &tus_req.data, previous))
+				.map(|outcome| outcome == game_specific_tus::MatchOutcome::Won);
+
+			let data_id = Client::create_tus_data_file(data_to_store).await;
 
 			let res = db.tus_set_user_data(&com_id, user_id, slot, data_id, &info, user_id, new_timestamp, compare_timestamp, compare_author_id);
 			match res {
-				Ok(()) => Ok(ErrorType::NoError),
+				Ok(()) => {
+					// Best effort: the save itself already succeeded, so a
+					// failure to record the history must not fail the request.
+					if let Err(e) = db.tus_record_data_history(&com_id, user_id, slot, data_id, new_timestamp, outcome) {
+						warn!("Failed to record tus data history for data_id {}: {:?}", data_id, e);
+					} else if let Some(won) = outcome {
+						// Nobody tells the server who won a match, so the
+						// match this save reports on is whichever one the
+						// account most recently finished. If the room has not
+						// broken up yet the reading stays on the save and the
+						// room claims it when it does.
+						match db.resolve_match_outcome(&com_id, user_id, data_id, won, new_timestamp) {
+							Ok(Some(match_id)) => debug!("Match {} resolved from a save by user {}", match_id, user_id),
+							Ok(None) => debug!("A result from user {} is waiting for its match to be recorded", user_id),
+							Err(e) => warn!("Failed to resolve a match outcome for user {}: {:?}", user_id, e),
+						}
+					}
+					if let Some(floored) = &floored {
+						// A raise the client has not been handed yet stays
+						// undelivered, so the next save it sends - written
+						// without it - is raised again. Nothing raised means
+						// nothing to deliver.
+						let delivered = floored.data.is_none();
+						if let Err(e) = db.tus_set_rank_floor(&com_id, user_id, slot, floored.floor, delivered) {
+							warn!("Failed to record the rank floor for user {}: {:?}", user_id, e);
+						}
+					}
+					// The slot now points at the new save, so the one it
+					// replaced is unreachable. Left behind it would accumulate
+					// at the rate players save, until a restart swept it up.
+					if let Some(superseded_id) = superseded_id {
+						Client::delete_tus_data(superseded_id).await;
+					}
+					Ok(ErrorType::NoError)
+				}
 				Err(DbError::Empty) => {
 					Client::delete_tus_data(data_id).await;
 					Ok(ErrorType::CondFail)
@@ -776,6 +842,14 @@ impl Client {
 				Vec::new(),
 			)
 		};
+
+		// The player now holds whatever the server last wrote, including a rank
+		// floor it raised. From here a demotion below that floor is their own.
+		if !user.vuser && *npid == self.client_info.npid {
+			if let Err(e) = db.tus_mark_rank_floor_delivered(&com_id, self.client_info.user_id, slot) {
+				warn!("Failed to mark the rank floor delivered for {}: {:?}", npid, e);
+			}
+		}
 
 		let final_tus_data = TusData { status, data: tus_data };
 
@@ -979,7 +1053,15 @@ impl Client {
 				return Ok(ErrorType::Unauthorized);
 			}
 
-			db.tus_delete_user_data_with_slotlist(&com_id, user_id, &tus_req.slot_id_array).map_err(|_| ErrorType::DbFail)?
+			db.tus_delete_user_data_with_slotlist(&com_id, user_id, &tus_req.slot_id_array).map_err(|_| ErrorType::DbFail)?;
+
+			// The slot's save is gone, so what the server held it to no longer
+			// describes anything. Left behind, the next save written into the
+			// slot is read as one already at its floor and goes without the
+			// starting rank.
+			if let Err(e) = db.tus_clear_rank_floor(&com_id, user_id, &tus_req.slot_id_array) {
+				warn!("Failed to clear the rank floor for user {}: {:?}", user_id, e);
+			}
 		}
 
 		Ok(ErrorType::NoError)
