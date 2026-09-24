@@ -12,6 +12,7 @@ verifies the result by md5. Nothing here touches the database.
     tdt_admin.py restore <npid> [--label NAME | --file PATH]
     tdt_admin.py list-backups [<npid>]
     tdt_admin.py set-rank <npid> --char N|NAME --rank N|NAME [--points N]
+    tdt_admin.py set-rank <npid> --char all --rank N|NAME
     tdt_admin.py set-rank --input-file X.tdt [<npid> | --output-file Y.tdt] --char ... --rank ...
     tdt_admin.py set-account-rank <npid> --rank N|NAME
     tdt_admin.py apply <npid> --file PATH
@@ -54,7 +55,8 @@ STAT_URL = "http://127.0.0.1:31314/rpcn_stats/usage"
 CHAR_BASE, CHAR_STRIDE, CHAR_N = 0x70, 0x30, 59
 OFF_ACCOUNT_RANK, OFF_ACCOUNT_PROGRESS = 0x18, 0x1B
 OFF_TOTAL, OFF_WINS, OFF_LOSSES = 0x20, 0xCDC, 0xCE0
-SLOT_RANK, SLOT_POINTS, SLOT_WIN, SLOT_LOSS = 0x00, 0x02, 0x08, 0x0C
+SLOT_RANK, SLOT_POINTS, SLOT_STREAK, SLOT_WIN, SLOT_LOSS = 0x00, 0x02, 0x04, 0x08, 0x0C
+ALL_CHARS = -1   # set-rank --char all
 
 # floor policy: reached tier(account rank = high water mark) -> two tiers below
 BASE_FLOOR = 10
@@ -365,11 +367,13 @@ for _i, _name in CHARACTERS.items():
 
 
 def parse_char(s):
-    """argparse type: a character id or name ('Paul', 'devil jin', 'p-jack')"""
+    """argparse type: a character id or name ('Paul', 'devil jin', 'p-jack'), or 'all'"""
     try:
         return int(s)
     except ValueError:
         pass
+    if _norm(s) == "all":
+        return ALL_CHARS
     ids = _CHAR_BY_NAME.get(_norm(s), [])
     if len(ids) > 1:
         # Michelle, Unknown처럼 같은 이름이 두 칸에 있는 경우
@@ -386,7 +390,7 @@ def decode(b, all_chars=False):
         o = CHAR_BASE + i * CHAR_STRIDE
         w, l = be32(b, o + SLOT_WIN), be32(b, o + SLOT_LOSS)
         if all_chars or w or l or b[o]:
-            s = b[o + 4]
+            s = b[o + SLOT_STREAK]
             name, tier = rank_name(b[o])
             chars.append({"id": i, "character": CHARACTERS.get(i, f"Unknown (0x{i:02X})"),
                           "rank": b[o], "rank_name": name, "tier": tier,
@@ -516,30 +520,54 @@ def _write_file(src, out, buf, action, **meta):
     print(f"  checksum 0x{ck:08X} -> {out}")
 
 
+def set_all_buf(b, rank):
+    """every character and the account rank -> rank, points FLOOR_POINTS[rank], streak 0;
+    returns the number of characters that changed"""
+    n = 0
+    for i in range(CHAR_N):
+        o = CHAR_BASE + i * CHAR_STRIDE
+        before = bytes(b[o:o + SLOT_STREAK + 1])
+        b[o] = rank
+        b[o + SLOT_POINTS:o + SLOT_POINTS + 2] = FLOOR_POINTS[rank].to_bytes(2, "big")
+        b[o + SLOT_STREAK] = 0
+        n += bytes(b[o:o + SLOT_STREAK + 1]) != before
+    b[OFF_ACCOUNT_RANK] = rank
+    return n
+
+
 def cmd_set_rank(a):
     if not a.npid and not a.file:
         die("give an npid or --input-file")
     if a.out and (not a.file or a.npid):
         die("--output-file needs --input-file and no npid")
-    if not 0 <= a.char < CHAR_N:
-        die(f"--char must be 0..{CHAR_N - 1}")
+    if a.char != ALL_CHARS and not 0 <= a.char < CHAR_N:
+        die(f"--char must be 0..{CHAR_N - 1} or all")
     if not 0 <= a.rank <= 255:
         die("--rank must be 0..255")
     if a.points is not None and not 0 <= a.points <= 0xFFFF:
         die("--points must be 0..65535")
+    if a.char == ALL_CHARS and (a.rank not in FLOOR_POINTS or a.points is not None):
+        die(f"--char all takes --rank {min(FLOOR_POINTS)}..{max(FLOOR_POINTS)} and no --points")
     b = read_save(a.file if a.file else lookup(a.npid)[3])
-    o = CHAR_BASE + a.char * CHAR_STRIDE
-    old_rank, old_pts = b[o], be16(b, o + SLOT_POINTS)
-    b[o] = a.rank
-    if a.points is not None:
-        b[o + SLOT_POINTS:o + SLOT_POINTS + 2] = a.points.to_bytes(2, "big")
-    print(f"{a.npid or a.file}  character {a.char} ({CHARACTERS[a.char]}): "
-          f"rank {old_rank} {rank_name(old_rank)[0]} -> {a.rank} {rank_name(a.rank)[0]}"
-          + (f", points {old_pts} -> {a.points}" if a.points is not None else ""))
+    if a.char == ALL_CHARS:
+        old_acc = b[OFF_ACCOUNT_RANK]
+        n = set_all_buf(b, a.rank)
+        print(f"{a.npid or a.file}  all characters -> {a.rank} {rank_name(a.rank)[0]}, "
+              f"{FLOOR_POINTS[a.rank]}pt, streak 0 ({n} changed); "
+              f"account rank {old_acc} -> {a.rank}")
+    else:
+        o = CHAR_BASE + a.char * CHAR_STRIDE
+        old_rank, old_pts = b[o], be16(b, o + SLOT_POINTS)
+        b[o] = a.rank
+        if a.points is not None:
+            b[o + SLOT_POINTS:o + SLOT_POINTS + 2] = a.points.to_bytes(2, "big")
+        print(f"{a.npid or a.file}  character {a.char} ({CHARACTERS[a.char]}): "
+              f"rank {old_rank} {rank_name(old_rank)[0]} -> {a.rank} {rank_name(a.rank)[0]}"
+              + (f", points {old_pts} -> {a.points}" if a.points is not None else ""))
     if a.dry_run:
         print("  (dry run, nothing written)")
         return
-    meta = {"char": a.char, "rank": a.rank, "points": a.points}
+    meta = {"char": "all" if a.char == ALL_CHARS else a.char, "rank": a.rank, "points": a.points}
     if not a.npid:
         _write_file(a.file, a.out, b, "set-rank-file", **meta)
         return
@@ -817,7 +845,9 @@ def main():
 
     s = sub.add_parser("set-rank")
     s.add_argument("npid", nargs="?")
-    s.add_argument("--char", type=parse_char, required=True, help="character id or name")
+    s.add_argument("--char", type=parse_char, required=True,
+                   help="character id or name, or 'all' (every character and the account rank; "
+                        "points from the floor table, streak 0)")
     s.add_argument("--rank", type=parse_rank, required=True)
     s.add_argument("--points", type=int)
     s.add_argument("--input-file", "--file", dest="file",
