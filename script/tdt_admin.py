@@ -478,6 +478,7 @@ def cmd_list_backups(a):
 
 
 def _apply(npid, buf, action, force, label=None, who=None, **meta):
+    """write buf as npid's live save; True if it landed, False if the game saved over it"""
     uid, data_id, saved, path = lookup(npid)
     guard_online(npid, force, who)
     before = md5(path)
@@ -498,8 +499,9 @@ def _apply(npid, buf, action, force, label=None, who=None, **meta):
     if data_id2 != data_id:
         print(f"  WARNING: data_id changed {data_id} -> {data_id2} while writing. "
               f"The game saved in the meantime and this edit is now orphaned.")
-    else:
-        print(f"  applied to data_id {data_id}")
+        return False
+    print(f"  applied to data_id {data_id}")
+    return True
 
 
 def _write_file(src, out, buf, action, **meta):
@@ -598,6 +600,33 @@ def floor_buf(b, rank=None):
     return m, y, n
 
 
+def floor_account(npid, rank=None, who=None, label=None, dry_run=False, force=False):
+    """floor one account's live save.
+
+    returns (status, raised) with status one of
+    applied | dry_run | no_change | online | orphaned | failed
+    """
+    try:
+        _, _, _, path = lookup(npid)
+        b = read_save(path)
+    except SystemExit:
+        return "failed", 0
+    m, y, n = floor_buf(b, rank)
+    if n == 0:
+        return "no_change", 0
+    if who is not None and npid in who and not force:
+        print(f"  {npid:20s} skipped (online)")
+        return "online", n
+    print(f"  {npid:20s} reached {m:2d} -> floor {y:2d}, {n} slots raised")
+    if dry_run:
+        return "dry_run", n
+    try:
+        landed = _apply(npid, b, "floor", force, label=label, who=who, floor=y, raised=n)
+    except SystemExit:
+        return "failed", n
+    return ("applied" if landed else "orphaned"), n
+
+
 def _floor_file(a):
     if len(a.npid) > 1 or a.all:
         die("--input-file takes at most one npid")
@@ -647,39 +676,21 @@ def cmd_floor(a):
     print(f"{len(names)} accounts, floor {a.rank if a.rank is not None else 'auto'}, "
           f"backup label {label}{'  (dry run)' if a.dry_run else ''}")
 
-    done = nochange = online_skip = failed = chars = 0
+    count = dict.fromkeys(("applied", "dry_run", "no_change", "online", "orphaned", "failed"), 0)
+    chars = 0
     for npid in names:
-        try:
-            _, _, _, path = lookup(npid)
-            b = read_save(path)
-        except SystemExit:
-            failed += 1
-            continue
-        m, y, n = floor_buf(b, a.rank)
-        if n == 0:
-            nochange += 1
-            continue
-        if npid in who and not a.force:
-            online_skip += 1
-            print(f"  {npid:20s} skipped (online)")
-            continue
-        print(f"  {npid:20s} reached {m:2d} -> floor {y:2d}, {n} slots raised")
-        if a.dry_run:
-            done += 1
+        status, n = floor_account(npid, a.rank, who, label, a.dry_run, a.force)
+        count[status] += 1
+        if status in ("applied", "dry_run"):
             chars += n
-            continue
-        try:
-            _apply(npid, b, "floor", a.force, label=label, who=who, floor=y, raised=n)
-            done += 1
-            chars += n
-        except SystemExit:
-            failed += 1
+    done = count["dry_run"] if a.dry_run else count["applied"]
 
     print(f"{'would apply' if a.dry_run else 'applied'} {done}  slots {chars:,}  "
-          f"no change {nochange}  online {online_skip}  failed {failed}")
+          f"no change {count['no_change']}  online {count['online']}  "
+          f"orphaned {count['orphaned']}  failed {count['failed']}")
     if not a.dry_run and len(names) > 1:
         audit("floor-batch", "-", accounts=done, slots=chars, label=label, rank=a.rank,
-              skipped_online=online_skip, failed=failed)
+              skipped_online=count["online"], orphaned=count["orphaned"], failed=count["failed"])
 
 
 def cmd_restore(a):
