@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""Apply the tier rank floor to TTT2 accounts created after the one-time pass.
+"""Start TTT2 accounts created after the one-time floor pass at the floor.
 
 A new user is an account created at or after CUTOFF (account_timestamp.creation,
-the start of the 2026-09-22 floor batch) that has a TTT2 save. Accounts made
-before CUTOFF were covered by that batch.
+the start of the 2026-09-22 floor batch). Accounts made before CUTOFF were
+covered by that batch.
 
-Each run:
-  1. find new users that are not in the done list yet
-  2. floor the ones that are offline and add them to the done list
+Each run, for every new user not in the done list yet:
+  - no TTT2 save yet -> give it a floored save built from TEMPLATE, so the game
+    loads 1st Dan on its first login instead of creating a rank 0 save
+  - has a TTT2 save  -> floor it while the player is offline, then add the
+    account to the done list
+
+A seeded account is not marked done right away. If the game created its own
+save before the seed landed, that save is floored on a later run; otherwise
+the floor finds nothing to raise and the account is marked done then.
 
 A save can only be edited while its owner is offline (the game overwrites the
 edit on its next save), so an online account is simply found again on the next
 run. The floor is applied once per account; the done list keeps it from being
 applied again after the player is demoted.
 
-The floor itself is tdt_admin.floor_account(), the same code path as
-`tdt_admin.py floor <npid>` (backup, reseal, verify, audit).
+The floor itself is tdt_admin.floor_buf() / floor_account(), the same code path
+as `tdt_admin.py floor <npid>` (backup, reseal, verify, audit).
 
     floor_new_users.py --init      create the done list; run once
     floor_new_users.py             one run
@@ -25,6 +31,7 @@ The floor itself is tdt_admin.floor_account(), the same code path as
 import os
 import sys
 import json
+import time
 import sqlite3
 import argparse
 import datetime as dt
@@ -32,6 +39,8 @@ import datetime as dt
 DB_PATH = "/home/ec2-user/rpcn-data/db/rpcn.db"
 BACKUP_DIR = "/home/ec2-user/backup/tdt"
 STATE = "/home/ec2-user/backup/tdt/floor_new_users.json"
+# a fresh save the game made itself (0 matches, rank 0); floored before use
+TEMPLATE = "/home/ec2-user/backup/tdt/template_new_user.tdt"
 COM_ID = "NPWR02973_00"
 SLOT = 1
 
@@ -63,18 +72,18 @@ def save_state(st):
 
 
 def new_users():
-    """[(npid, created)] for accounts created at or after CUTOFF that have a TTT2 save"""
+    """[(npid, user_id, created, has_save)] for accounts created at or after CUTOFF"""
     con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2)
     rows = con.execute(
-        "SELECT a.username, ts.creation FROM account a "
+        "SELECT a.username, a.user_id, ts.creation, t.data_id IS NOT NULL FROM account a "
         "JOIN account_timestamp ts ON ts.user_id = a.user_id "
-        "JOIN tus_data t ON t.owner_id = a.user_id "
-        "WHERE ts.creation >= ? AND CAST(t.communication_id AS TEXT) = ? AND t.slot_id = ? "
-        "ORDER BY ts.creation",
-        (int(CUTOFF.timestamp()), COM_ID, SLOT)).fetchall()
+        "LEFT JOIN tus_data t ON t.owner_id = a.user_id "
+        "AND CAST(t.communication_id AS TEXT) = ? AND t.slot_id = ? "
+        "WHERE ts.creation >= ? ORDER BY ts.creation",
+        (COM_ID, SLOT, int(CUTOFF.timestamp()))).fetchall()
     con.close()
-    return [(npid, dt.datetime.fromtimestamp(c, KST).isoformat(timespec="seconds"))
-            for npid, c in rows]
+    return [(npid, uid, dt.datetime.fromtimestamp(c, KST).isoformat(timespec="seconds"), bool(s))
+            for npid, uid, c, s in rows]
 
 
 def already_floored(npid):
@@ -83,20 +92,84 @@ def already_floored(npid):
     return os.path.isdir(d) and any(f.startswith("pre-floor-") for f in os.listdir(d))
 
 
+# ----------------------------------------------------------------- seed
+def floored_template(ta):
+    b = ta.read_save(TEMPLATE)
+    _, y, _ = ta.floor_buf(b)
+    ta.reseal(b)
+    return b, y
+
+
+def free_data_id(ta, con):
+    """an unused id below every file on disk; RPCN's dispenser never hands those out again"""
+    used = {r[0] for r in con.execute("SELECT data_id FROM tus_data")}
+    used |= {r[0] for r in con.execute("SELECT data_id FROM tus_data_vuser")}
+    top = max(int(f[:-4]) for f in os.listdir(ta.TUS_DIR) if f.endswith(".tdt"))
+    for i in range(top - 1000, 0, -1):
+        if i not in used and not os.path.exists(os.path.join(ta.TUS_DIR, f"{i:020d}.tdt")):
+            return i
+    ta.die("no free data_id")
+
+
+def seed(ta, npid, uid, buf, floor):
+    """write buf as npid's first TTT2 save; False if the game created one first"""
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        data_id = free_data_id(ta, con)
+        path = os.path.join(ta.TUS_DIR, f"{data_id:020d}.tdt")
+        with open(path, "wb") as f:
+            f.write(bytes(buf))
+        os.chmod(path, 0o644)
+        tick = (int(time.time()) + 62135596800) * 1_000_000
+        try:
+            with con:
+                # plain INSERT: fails if the game already created this account's save
+                con.execute(
+                    "INSERT INTO tus_data (owner_id, communication_id, slot_id, data_id, data_info, "
+                    "timestamp, author_id) VALUES (?, ?, ?, ?, x'', ?, ?)",
+                    (uid, COM_ID.encode(), SLOT, data_id, tick, uid))
+        except sqlite3.IntegrityError:
+            os.unlink(path)
+            return False
+    finally:
+        con.close()
+    ta.audit("seed-floor-save", npid, data_id=data_id, template=TEMPLATE, floor=floor,
+             md5=ta.md5(path))
+    return True
+
+
 # ------------------------------------------------------------------ run
 def run_once(st, dry_run):
-    todo = [(npid, c) for npid, c in new_users() if npid not in st["done"]]
+    todo = [u for u in new_users() if u[0] not in st["done"]]
     if not todo:
         return
 
     import tdt_admin as ta
+
+    # accounts that have never saved: seed a floored save before the game makes one
+    template = None
+    for npid, uid, created, has_save in todo:
+        if has_save:
+            continue
+        if template is None:
+            template = floored_template(ta)
+        if dry_run:
+            log(f"{npid} (created {created}): would seed a floor {template[1]} save")
+        elif seed(ta, npid, uid, *template):
+            log(f"{npid} (created {created}): seeded a floor {template[1]} save")
+        else:
+            log(f"{npid} (created {created}): the game saved first, floored on a later run")
+
+    # accounts with a save: floor it once the player is offline
+    saved = [(npid, created) for npid, _, created, has_save in todo if has_save]
+    if not saved:
+        return
     who = ta.online()
     if who is None:
         log("stat server unreachable, cannot tell who is offline; retry next run")
         return
-
     label = "pre-floor-new-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    for npid, created in todo:
+    for npid, created in saved:
         if npid in who:
             continue
         status, _ = ta.floor_account(npid, who=who, label=label, dry_run=dry_run)
@@ -112,7 +185,7 @@ def cmd_init():
         sys.exit(f"error: {STATE} already exists; delete it to re-init")
     # new users floored before this script existed must not be floored twice
     done = {npid: {"ts": now(), "status": "floored-before-init"}
-            for npid, _ in new_users() if already_floored(npid)}
+            for npid, _, _, has_save in new_users() if has_save and already_floored(npid)}
     save_state({"cutoff": CUTOFF.isoformat(), "done": done})
     log(f"init: cutoff {CUTOFF.isoformat()}, {len(done)} accounts already floored")
     for npid in done:
@@ -122,9 +195,10 @@ def cmd_init():
 def cmd_status(st):
     rows = new_users()
     print(f"cutoff {st['cutoff']}   new users {len(rows)}   done {len(st['done'])}")
-    for npid, created in rows:
+    for npid, _, created, has_save in rows:
         d = st["done"].get(npid)
-        print(f"  {npid:20s} created {created}  " + (f"{d['status']} {d['ts']}" if d else "not done"))
+        state = f"{d['status']} {d['ts']}" if d else ("not done" if has_save else "no save yet")
+        print(f"  {npid:20s} created {created}  {state}")
 
 
 def main():
