@@ -14,3 +14,9 @@ services:
       - rpcn-storage:/rpcn
     # Only works on Linux currently.
     network_mode: host
+    # Rotated and compressed; keeps at most ~1 GB of container logs.
+    logging:
+      driver: local
+      options:
+        max-size: "100m"
+        max-file: "10"
