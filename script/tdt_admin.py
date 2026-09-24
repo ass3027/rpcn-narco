@@ -58,9 +58,11 @@ OFF_TOTAL, OFF_WINS, OFF_LOSSES = 0x20, 0xCDC, 0xCE0
 SLOT_RANK, SLOT_POINTS, SLOT_STREAK, SLOT_WIN, SLOT_LOSS = 0x00, 0x02, 0x04, 0x08, 0x0C
 ALL_CHARS = -1   # set-rank --char all
 
-# floor policy: reached tier(account rank = high water mark) -> two tiers below
+# floor policy: reached tier (account rank = high water mark) -> floor rank.
+# two tiers below, except Brawler (17..20) -> Disciple and Warrior (21..24) -> Master
 BASE_FLOOR = 10
 TIERS = [10, 13, 17, 21, 25, 29, 33, 38, 41]
+FLOOR_BY_TIER = {10: 10, 13: 10, 17: 13, 21: 15, 25: 17, 29: 21, 33: 25, 38: 29, 41: 33}
 
 FLOOR_POINTS = {r: 200 * r for r in range(1, 10)}
 FLOOR_POINTS[10] = 0
@@ -603,11 +605,8 @@ def cmd_apply(a):
 
 
 def floor_for(m):
-    idx = -1
-    for i, t in enumerate(TIERS):
-        if m >= t:
-            idx = i
-    return TIERS[idx - 2] if idx >= 2 else BASE_FLOOR
+    reached = [t for t in TIERS if m >= t]
+    return FLOOR_BY_TIER[reached[-1]] if reached else BASE_FLOOR
 
 
 def floor_buf(b, rank=None):
