@@ -11,13 +11,17 @@ verifies the result by md5. Nothing here touches the database.
     tdt_admin.py backup <npid>... | --all [--label NAME]
     tdt_admin.py restore <npid> [--label NAME | --file PATH]
     tdt_admin.py list-backups [<npid>]
-    tdt_admin.py set-rank <npid> --char N --rank N|NAME [--points N]
+    tdt_admin.py set-rank <npid> --char N|NAME --rank N|NAME [--points N]
+    tdt_admin.py set-rank --input-file X.tdt [<npid> | --output-file Y.tdt] --char ... --rank ...
     tdt_admin.py set-account-rank <npid> --rank N|NAME
     tdt_admin.py apply <npid> --file PATH
     tdt_admin.py floor <npid>... | --all [--rank N|NAME] [--label NAME]
     tdt_admin.py floor --input-file X.tdt [<npid> | --output-file Y.tdt] [--rank N|NAME]
     tdt_admin.py log [-n N]
     tdt_admin.py gc [--apply] [--archive] [--keep-days N]
+
+<npid> is the RPCN username, matched case-insensitively. A name that matches
+no account or more than one stops the command before anything is written.
 
 Writes refuse to run while the target account is online unless --force is
 given, because the game issues a new data_id on its next save and would
@@ -147,6 +151,45 @@ def db():
     if not os.path.exists(DB_PATH):
         die(f"database not found: {DB_PATH}")
     return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+
+
+def _match(con, name):
+    return [r[0] for r in con.execute(
+        "SELECT username FROM account WHERE username = ? COLLATE NOCASE ORDER BY user_id", (name,))]
+
+
+def _match_error(name, found):
+    if not found:
+        return f"account {name!r} not found"
+    return f"account {name!r} matches {len(found)} accounts: {', '.join(found)}"
+
+
+def resolve(name):
+    """username(npid, case-insensitive) -> the stored username; exactly one match or exit"""
+    con = db()
+    found = _match(con, name)
+    con.close()
+    if len(found) != 1:
+        die(_match_error(name, found))
+    return found[0]
+
+
+def resolve_all(names):
+    """resolve every name before anything is written; exit if any is missing or ambiguous"""
+    con = db()
+    out, errors = [], []
+    for name in names:
+        found = _match(con, name)
+        if len(found) != 1:
+            errors.append(_match_error(name, found))
+        elif found[0] not in out:
+            out.append(found[0])
+    con.close()
+    if errors:
+        for e in errors:
+            print(f"  {e}", file=sys.stderr)
+        die(f"{len(errors)} of {len(names)} accounts did not resolve; nothing was done")
+    return out
 
 
 def lookup(npid):
@@ -316,6 +359,27 @@ def parse_rank(s):
     return code
 
 
+_CHAR_BY_NAME = {}
+for _i, _name in CHARACTERS.items():
+    _CHAR_BY_NAME.setdefault(_norm(_name), []).append(_i)
+
+
+def parse_char(s):
+    """argparse type: a character id or name ('Paul', 'devil jin', 'p-jack')"""
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    ids = _CHAR_BY_NAME.get(_norm(s), [])
+    if len(ids) > 1:
+        # Michelle, Unknown처럼 같은 이름이 두 칸에 있는 경우
+        raise argparse.ArgumentTypeError(f"character {s!r} is ambiguous: ids {ids}. use the number")
+    if not ids:
+        names = ", ".join(sorted(set(CHARACTERS.values())))
+        raise argparse.ArgumentTypeError(f"unknown character {s!r}. use 0..{CHAR_N - 1} or one of: {names}")
+    return ids[0]
+
+
 def decode(b, all_chars=False):
     chars = []
     for i in range(CHAR_N):
@@ -438,24 +502,49 @@ def _apply(npid, buf, action, force, label=None, who=None, **meta):
         print(f"  applied to data_id {data_id}")
 
 
+def _write_file(src, out, buf, action, **meta):
+    """write an edited save to a plain file (no DB); in place keeps a .bak of the original"""
+    out = out or src
+    if out == src:
+        shutil.copyfile(src, src + ".bak")
+    ck = reseal(buf)
+    with open(out, "wb") as f:
+        f.write(bytes(buf))
+    audit(action, "-", source=src, out=out, checksum=f"0x{ck:08X}", **meta)
+    print(f"  checksum 0x{ck:08X} -> {out}")
+
+
 def cmd_set_rank(a):
+    if not a.npid and not a.file:
+        die("give an npid or --input-file")
+    if a.out and (not a.file or a.npid):
+        die("--output-file needs --input-file and no npid")
     if not 0 <= a.char < CHAR_N:
         die(f"--char must be 0..{CHAR_N - 1}")
     if not 0 <= a.rank <= 255:
         die("--rank must be 0..255")
-    uid, data_id, saved, path = lookup(a.npid)
-    b = read_save(path)
+    if a.points is not None and not 0 <= a.points <= 0xFFFF:
+        die("--points must be 0..65535")
+    b = read_save(a.file if a.file else lookup(a.npid)[3])
     o = CHAR_BASE + a.char * CHAR_STRIDE
     old_rank, old_pts = b[o], be16(b, o + SLOT_POINTS)
     b[o] = a.rank
     if a.points is not None:
         b[o + SLOT_POINTS:o + SLOT_POINTS + 2] = a.points.to_bytes(2, "big")
-    print(f"{a.npid}  character {a.char}: rank {old_rank} -> {a.rank}"
+    print(f"{a.npid or a.file}  character {a.char} ({CHARACTERS[a.char]}): "
+          f"rank {old_rank} {rank_name(old_rank)[0]} -> {a.rank} {rank_name(a.rank)[0]}"
           + (f", points {old_pts} -> {a.points}" if a.points is not None else ""))
     if a.dry_run:
         print("  (dry run, nothing written)")
         return
-    _apply(a.npid, b, "set-rank", a.force, char=a.char, rank=a.rank, points=a.points)
+    meta = {"char": a.char, "rank": a.rank, "points": a.points}
+    if not a.npid:
+        _write_file(a.file, a.out, b, "set-rank-file", **meta)
+        return
+    # --input-file와 npid를 같이 주면 그 파일을 고친 결과를 계정 세이브에 쓴다
+    if a.file:
+        meta["source"] = a.file
+    _apply(a.npid, b, "set-rank", a.force, **meta)
 
 
 def cmd_set_account_rank(a):
@@ -524,17 +613,10 @@ def _floor_file(a):
         _apply(a.npid[0], b, "floor", a.force, source=a.file, floor=y, raised=n)
         return
 
-    out = a.out or a.file
     if a.dry_run or n == 0:
         print("  (dry run, nothing written)" if a.dry_run else "  no change")
         return
-    if out == a.file:
-        shutil.copyfile(a.file, a.file + ".bak")
-    ck = reseal(b)
-    with open(out, "wb") as f:
-        f.write(bytes(b))
-    audit("floor-file", "-", source=a.file, out=out, floor=y, raised=n, checksum=f"0x{ck:08X}")
-    print(f"  checksum 0x{ck:08X} -> {out}")
+    _write_file(a.file, a.out, b, "floor-file", floor=y, raised=n)
 
 
 def cmd_floor(a):
@@ -723,10 +805,14 @@ def main():
     common(s); s.set_defaults(fn=cmd_restore)
 
     s = sub.add_parser("set-rank")
-    s.add_argument("npid")
-    s.add_argument("--char", type=int, required=True)
+    s.add_argument("npid", nargs="?")
+    s.add_argument("--char", type=parse_char, required=True, help="character id or name")
     s.add_argument("--rank", type=parse_rank, required=True)
     s.add_argument("--points", type=int)
+    s.add_argument("--input-file", "--file", dest="file",
+                   help="edit this .tdt file instead of the live one")
+    s.add_argument("--output-file", "--out", dest="out",
+                   help="with --input-file and no npid: write here instead of in place")
     common(s); s.set_defaults(fn=cmd_set_rank)
 
     s = sub.add_parser("set-account-rank")
@@ -766,6 +852,14 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     except AttributeError:
         pass
+
+    # 계정 이름은 대소문자 무시로 DB에서 확정한다. list-backups는 삭제된 계정의 백업도 봐야 하므로 제외
+    if a.cmd != "list-backups":
+        npid = getattr(a, "npid", None)
+        if isinstance(npid, str):
+            a.npid = resolve(npid)
+        elif npid:
+            a.npid = resolve_all(npid)
     a.fn(a)
 
 
