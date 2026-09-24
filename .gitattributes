@@ -1,0 +1,2 @@
+# shell scripts run on the Linux host; CRLF breaks bash
+*.sh text eol=lf
