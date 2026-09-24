@@ -64,20 +64,12 @@ BASE_FLOOR = 10
 TIERS = [10, 13, 17, 21, 25, 29, 33, 38, 41]
 FLOOR_BY_TIER = {10: 10, 13: 10, 17: 13, 21: 15, 25: 17, 29: 21, 33: 25, 38: 29, 41: 33}
 
+# rank points set with a floor. kyu ranks (1..9) sit at 200 * rank; 1st dan (10) cannot be
+# demoted. above that a loss is -2000 and the gauge going below 0 demotes, so 5000 gives
+# 3000 after one loss, 1000 (next loss demotes) after two, and demotion on the third.
 FLOOR_POINTS = {r: 200 * r for r in range(1, 10)}
 FLOOR_POINTS[10] = 0
-_P10 = {11: 2531, 12: 2735, 13: 2300, 14: 3112, 15: 2907, 16: 2799,
-        17: 5993, 18: 1562, 19: 1964, 21: 2679}
-for _r in range(11, 43):
-    if _r in _P10:
-        FLOOR_POINTS[_r] = _P10[_r]
-    else:
-        _lo = max([k for k in _P10 if k < _r], default=None)
-        _hi = min([k for k in _P10 if k > _r], default=None)
-        if _lo is not None and _hi is not None:
-            FLOOR_POINTS[_r] = int(round(_P10[_lo] + (_r - _lo) / (_hi - _lo) * (_P10[_hi] - _P10[_lo])))
-        else:
-            FLOOR_POINTS[_r] = _P10[_lo if _lo is not None else _hi]
+FLOOR_POINTS.update({r: 5000 for r in range(11, 43)})
 
 # --------------------------------------------------------------- checksum
 P = 0x1DB710641
