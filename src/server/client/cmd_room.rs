@@ -92,6 +92,9 @@ impl Client {
 	}
 
 	pub async fn leave_room(&self, com_id: &ComId, room_id: u64, opt_data: Option<&PresenceOptionData>, event_cause: EventCause) -> ErrorType {
+		// Set only when the room still has both players, under the write lock
+		// below, so a match is recorded once: by whoever leaves first.
+		let mut finished_match_opponent_id: Option<i64> = None;
 		let opponent_npid = {
 			let room_manager = self.shared.room_manager.read();
 			if room_manager.room_exists(com_id, room_id) {
@@ -118,6 +121,15 @@ impl Client {
 			}
 
 			let room = room_manager.get_room(com_id, room_id);
+
+			// Decided under the write lock that removes the user, so of two
+			// players leaving at the same moment - which is how a match ends -
+			// exactly one still sees a full room and the match is recorded
+			// once. Reading this under the shared lock above recorded it twice.
+			if room.users.len() == 2 {
+				finished_match_opponent_id = room.users.values().find(|u| u.user_id != self.client_info.user_id).map(|u| u.user_id);
+			}
+
 			let member_id = room.get_member_id(self.client_info.user_id);
 			if let Err(e) = member_id {
 				return e;
@@ -144,6 +156,19 @@ impl Client {
 			pairs.insert(my_npid.clone(), (opp_npid_clone.clone(), std::time::Instant::now()));
 			pairs.insert(opp_npid_clone, (my_npid, std::time::Instant::now()));
 			info!("Rematch pair registered: {} <-> {}", self.client_info.npid, opp_npid);
+		}
+
+		// Best effort: the player has already left, so a failure here must not
+		// turn into an error for them.
+		if let Some(opponent_id) = finished_match_opponent_id {
+			match self.get_database_connection() {
+				Ok(conn) => {
+					if let Err(e) = Database::new(conn).record_match(com_id, room_id, self.client_info.user_id, opponent_id, Client::get_psn_timestamp()) {
+						warn!("Failed to record match history for room {}: {:?}", room_id, e);
+					}
+				}
+				Err(_) => warn!("No database connection available to record match history for room {}", room_id),
+			}
 		}
 
 		if destroyed {
