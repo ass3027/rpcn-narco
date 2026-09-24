@@ -27,6 +27,9 @@ as `tdt_admin.py floor <npid>` (backup, reseal, verify, audit).
     floor_new_users.py             one run
     floor_new_users.py --dry-run   one run without writing anything
     floor_new_users.py --status    show new users and whether they are done
+
+The done list (floor_new_users.json) and the template save
+(template_new_user.tdt) live next to this script.
 """
 import os
 import sys
@@ -36,11 +39,12 @@ import sqlite3
 import argparse
 import datetime as dt
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = "/home/ec2-user/rpcn-data/db/rpcn.db"
 BACKUP_DIR = "/home/ec2-user/backup/tdt"
-STATE = "/home/ec2-user/backup/tdt/floor_new_users.json"
+STATE = os.path.join(HERE, "floor_new_users.json")
 # a fresh save the game made itself (0 matches, rank 0); floored before use
-TEMPLATE = "/home/ec2-user/backup/tdt/template_new_user.tdt"
+TEMPLATE = os.path.join(HERE, "template_new_user.tdt")
 COM_ID = "NPWR02973_00"
 SLOT = 1
 
@@ -220,5 +224,5 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, HERE)
     main()
