@@ -18,6 +18,7 @@ verifies the result by md5. Nothing here touches the database.
     tdt_admin.py apply <npid> --file PATH
     tdt_admin.py floor <npid>... | --all [--rank N|NAME] [--label NAME] [--fix-points]
     tdt_admin.py floor --input-file X.tdt [<npid> | --output-file Y.tdt] [--rank N|NAME] [--fix-points]
+    tdt_admin.py floor --redo LABEL [<npid>...] [--label NAME]
     tdt_admin.py log [-n N]
     tdt_admin.py gc [--apply] [--archive] [--keep-days N]
 
@@ -688,7 +689,125 @@ def _floor_file(a):
     _write_file(a.file, a.out, b, "floor-file", **meta)
 
 
+def _slot_state(b, o):
+    s = b[o + SLOT_STREAK]
+    return b[o], be16(b, o + SLOT_POINTS), s - 256 if s > 127 else s
+
+
+def redo_buf(pre, cur, y_old):
+    """re-run an earlier floor with the current rule, on the characters it raised and
+    nobody has played since.
+
+    pre is the save before that floor, cur the live save now, y_old the floor it used.
+    Returns (y_new, changes, played) where changes is [(char, (rank, points, streak) now,
+    (rank, points, streak) new)] and played lists raised characters that have games since.
+    cur is edited in place."""
+    target = bytearray(pre)
+    _, y_new, _ = floor_buf(target)
+    changes, played = [], []
+    for i in range(CHAR_N):
+        o = CHAR_BASE + i * CHAR_STRIDE
+        if pre[o] >= y_old:
+            continue                     # the earlier floor did not touch it
+        now, new = _slot_state(cur, o), _slot_state(target, o)
+        same_games = cur[o + SLOT_WIN:o + SLOT_LOSS + 4] == pre[o + SLOT_WIN:o + SLOT_LOSS + 4]
+        if same_games and now == new:
+            continue                     # already what the current rule gives (e.g. redone before)
+        if not (same_games and cur[o] == y_old and cur[o + SLOT_STREAK] == pre[o + SLOT_STREAK]):
+            played.append(i)
+            continue
+        cur[o] = target[o]
+        cur[o + SLOT_POINTS:o + SLOT_POINTS + 2] = target[o + SLOT_POINTS:o + SLOT_POINTS + 2]
+        cur[o + SLOT_STREAK] = target[o + SLOT_STREAK]
+        changes.append((i, now, new))
+    # account rank: only if the earlier floor raised it and it has not moved since
+    if pre[OFF_ACCOUNT_RANK] < y_old and cur[OFF_ACCOUNT_RANK] == y_old != target[OFF_ACCOUNT_RANK]:
+        changes.append(("account", (cur[OFF_ACCOUNT_RANK],), (target[OFF_ACCOUNT_RANK],)))
+        cur[OFF_ACCOUNT_RANK] = target[OFF_ACCOUNT_RANK]
+    return y_new, changes, played
+
+
+def cmd_floor_redo(a):
+    """re-run the floor recorded under backup label a.redo with the current rule"""
+    entries = {}
+    for line in open(AUDIT_LOG, encoding="utf-8"):
+        r = json.loads(line)
+        if r["action"] == "floor" and r.get("backup", "").endswith(os.sep + a.redo + ".tdt"):
+            entries[r["npid"]] = r
+    if not entries:
+        die(f"no floor recorded with backup label {a.redo!r}")
+    names = [n for n in a.npid if n in entries] if a.npid else sorted(entries)
+    missing = [n for n in a.npid if n not in entries]
+    if missing:
+        die(f"not floored under {a.redo}: {', '.join(missing)}")
+    detail = bool(a.npid)
+
+    who = online()
+    if who is None:
+        if not a.dry_run:
+            die("stat server unreachable, cannot check who is offline; nothing written")
+        print("  warn: stat server unreachable, online accounts are not marked")
+        who = set()
+    label = a.label or "pre-redo-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    print(f"redo {a.redo}: {len(names)} accounts, backup label {label}"
+          f"{'  (dry run)' if a.dry_run else ''}")
+
+    count = dict.fromkeys(("applied", "dry_run", "no_change", "online", "orphaned", "failed"), 0)
+    chars = kept = 0
+    for npid in names:
+        r = entries[npid]
+        try:
+            _, _, _, path = lookup(npid)
+            cur = read_save(path)
+            pre = read_save(r["backup"])
+        except SystemExit:
+            count["failed"] += 1
+            continue
+        y_new, changes, played = redo_buf(pre, cur, r["floor"])
+        kept += len(played)
+        if not changes:
+            count["no_change"] += 1
+            if detail:
+                print(f"  {npid:20s} floor {r['floor']} -> {y_new}: no change, kept played {played}")
+            continue
+        if npid in who and not a.force:
+            count["online"] += 1
+            print(f"  {npid:20s} skipped (online)")
+            continue
+        print(f"  {npid:20s} floor {r['floor']:2d} -> {y_new:2d}: {len(changes)} changed, "
+              f"{len(played)} played since kept")
+        if detail:
+            for c, now, new in changes:
+                name = "account rank" if c == "account" else f"{c:2d} {CHARACTERS.get(c, c)}"
+                print(f"      {name:18s} {now} -> {new}")
+            if played:
+                print(f"      kept (played since): {[(c, CHARACTERS.get(c, c)) for c in played]}")
+        chars += len(changes)
+        if a.dry_run:
+            count["dry_run"] += 1
+            continue
+        try:
+            landed = _apply(npid, cur, "floor-redo", a.force, label=label, who=who, redo=a.redo,
+                            floor_old=r["floor"], floor=y_new, changed=len(changes), kept=len(played))
+        except SystemExit:
+            count["failed"] += 1
+            continue
+        count["applied" if landed else "orphaned"] += 1
+
+    done = count["dry_run"] if a.dry_run else count["applied"]
+    print(f"{'would apply' if a.dry_run else 'applied'} {done}  slots {chars:,}  played kept {kept}  "
+          f"no change {count['no_change']}  online {count['online']}  "
+          f"orphaned {count['orphaned']}  failed {count['failed']}")
+    if not a.dry_run and len(names) > 1:
+        audit("floor-redo-batch", "-", redo=a.redo, accounts=done, slots=chars, kept=kept, label=label,
+              skipped_online=count["online"], orphaned=count["orphaned"], failed=count["failed"])
+
+
 def cmd_floor(a):
+    if a.redo:
+        if a.all or a.file or a.out or a.rank is not None or a.fix_points:
+            die("--redo takes only npids, --label, --dry-run and --force")
+        return cmd_floor_redo(a)
     if a.rank is not None and a.rank not in FLOOR_POINTS:
         die(f"--rank must be {min(FLOOR_POINTS)}..{max(FLOOR_POINTS)}")
     if a.out and not a.file:
@@ -891,6 +1010,10 @@ def main():
     s.add_argument("--fix-points", action="store_true",
                    help="also give characters already at the floor rank the floor points "
                         "when they have fewer")
+    s.add_argument("--redo", metavar="LABEL",
+                   help="re-run the floor backed up under LABEL with the current rule, only on "
+                        "the characters it raised that have not been played since; "
+                        "npids limit it and print per-character detail")
     common(s); s.set_defaults(fn=cmd_floor)
 
     s = sub.add_parser("log")
