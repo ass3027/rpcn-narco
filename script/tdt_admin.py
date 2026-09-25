@@ -16,8 +16,8 @@ verifies the result by md5. Nothing here touches the database.
     tdt_admin.py set-rank --input-file X.tdt [<npid> | --output-file Y.tdt] --char ... --rank ...
     tdt_admin.py set-account-rank <npid> --rank N|NAME
     tdt_admin.py apply <npid> --file PATH
-    tdt_admin.py floor <npid>... | --all [--rank N|NAME] [--label NAME]
-    tdt_admin.py floor --input-file X.tdt [<npid> | --output-file Y.tdt] [--rank N|NAME]
+    tdt_admin.py floor <npid>... | --all [--rank N|NAME] [--label NAME] [--fix-points]
+    tdt_admin.py floor --input-file X.tdt [<npid> | --output-file Y.tdt] [--rank N|NAME] [--fix-points]
     tdt_admin.py log [-n N]
     tdt_admin.py gc [--apply] [--archive] [--keep-days N]
 
@@ -620,10 +620,26 @@ def floor_buf(b, rank=None):
     return m, y, n
 
 
-def floor_account(npid, rank=None, who=None, label=None, dry_run=False, force=False):
+def fix_floor_points(b, y):
+    """characters sitting exactly at floor y with fewer points than FLOOR_POINTS[y] get
+    FLOOR_POINTS[y] (e.g. left over from an older, lower floor value); returns how many"""
+    n = 0
+    for i in range(CHAR_N):
+        o = CHAR_BASE + i * CHAR_STRIDE
+        if b[o] == y and be16(b, o + SLOT_POINTS) < FLOOR_POINTS[y]:
+            b[o + SLOT_POINTS:o + SLOT_POINTS + 2] = FLOOR_POINTS[y].to_bytes(2, "big")
+            n += 1
+    return n
+
+
+def _floor_summary(m, y, n, f, fix_points):
+    return f"reached {m:2d} -> floor {y:2d}, {n} slots raised" + (f", {f} points fixed" if fix_points else "")
+
+
+def floor_account(npid, rank=None, who=None, label=None, dry_run=False, force=False, fix_points=False):
     """floor one account's live save.
 
-    returns (status, raised) with status one of
+    returns (status, changed) with status one of
     applied | dry_run | no_change | online | orphaned | failed
     """
     try:
@@ -632,19 +648,21 @@ def floor_account(npid, rank=None, who=None, label=None, dry_run=False, force=Fa
     except SystemExit:
         return "failed", 0
     m, y, n = floor_buf(b, rank)
-    if n == 0:
+    f = fix_floor_points(b, y) if fix_points else 0
+    if n + f == 0:
         return "no_change", 0
     if who is not None and npid in who and not force:
         print(f"  {npid:20s} skipped (online)")
-        return "online", n
-    print(f"  {npid:20s} reached {m:2d} -> floor {y:2d}, {n} slots raised")
+        return "online", n + f
+    print(f"  {npid:20s} {_floor_summary(m, y, n, f, fix_points)}")
     if dry_run:
-        return "dry_run", n
+        return "dry_run", n + f
     try:
-        landed = _apply(npid, b, "floor", force, label=label, who=who, floor=y, raised=n)
+        landed = _apply(npid, b, "floor", force, label=label, who=who, floor=y, raised=n,
+                        **({"points_fixed": f} if fix_points else {}))
     except SystemExit:
-        return "failed", n
-    return ("applied" if landed else "orphaned"), n
+        return "failed", n + f
+    return ("applied" if landed else "orphaned"), n + f
 
 
 def _floor_file(a):
@@ -652,20 +670,22 @@ def _floor_file(a):
         die("--input-file takes at most one npid")
     b = read_save(a.file)
     m, y, n = floor_buf(b, a.rank)
-    print(f"{a.file}  reached {m} -> floor {y}, {n} slots raised")
+    f = fix_floor_points(b, y) if a.fix_points else 0
+    print(f"{a.file}  {_floor_summary(m, y, n, f, a.fix_points)}")
+    meta = {"floor": y, "raised": n, **({"points_fixed": f} if a.fix_points else {})}
 
     if a.npid:
         # 지정 파일에 floor를 적용한 결과를 해당 계정의 현재 세이브로 쓴다
         if a.dry_run:
             print("  (dry run, nothing written)")
             return
-        _apply(a.npid[0], b, "floor", a.force, source=a.file, floor=y, raised=n)
+        _apply(a.npid[0], b, "floor", a.force, source=a.file, **meta)
         return
 
-    if a.dry_run or n == 0:
+    if a.dry_run or n + f == 0:
         print("  (dry run, nothing written)" if a.dry_run else "  no change")
         return
-    _write_file(a.file, a.out, b, "floor-file", floor=y, raised=n)
+    _write_file(a.file, a.out, b, "floor-file", **meta)
 
 
 def cmd_floor(a):
@@ -699,7 +719,7 @@ def cmd_floor(a):
     count = dict.fromkeys(("applied", "dry_run", "no_change", "online", "orphaned", "failed"), 0)
     chars = 0
     for npid in names:
-        status, n = floor_account(npid, a.rank, who, label, a.dry_run, a.force)
+        status, n = floor_account(npid, a.rank, who, label, a.dry_run, a.force, a.fix_points)
         count[status] += 1
         if status in ("applied", "dry_run"):
             chars += n
@@ -710,7 +730,8 @@ def cmd_floor(a):
           f"orphaned {count['orphaned']}  failed {count['failed']}")
     if not a.dry_run and len(names) > 1:
         audit("floor-batch", "-", accounts=done, slots=chars, label=label, rank=a.rank,
-              skipped_online=count["online"], orphaned=count["orphaned"], failed=count["failed"])
+              fix_points=a.fix_points, skipped_online=count["online"],
+              orphaned=count["orphaned"], failed=count["failed"])
 
 
 def cmd_restore(a):
@@ -867,6 +888,9 @@ def main():
     s.add_argument("--output-file", "--out", dest="out",
                    help="with --input-file and no npid: write here instead of in place")
     s.add_argument("--label", help="backup label (default pre-floor-<stamp>)")
+    s.add_argument("--fix-points", action="store_true",
+                   help="also give characters already at the floor rank the floor points "
+                        "when they have fewer")
     common(s); s.set_defaults(fn=cmd_floor)
 
     s = sub.add_parser("log")
