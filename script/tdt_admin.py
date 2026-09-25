@@ -59,11 +59,11 @@ SLOT_RANK, SLOT_POINTS, SLOT_STREAK, SLOT_WIN, SLOT_LOSS = 0x00, 0x02, 0x04, 0x0
 ALL_CHARS = -1   # set-rank --char all
 
 # floor policy: reached tier (account rank = high water mark) -> floor rank.
-# two tiers below, except Brawler (17..20) -> Disciple, Warrior (21..24) -> Master,
+# two tiers below, except Brawler (17..20) -> 3rd dan, Warrior (21..24) -> Mentor,
 # Genbu (29..32) -> Fighter and Fujin (33..37) -> Warrior
 BASE_FLOOR = 10
 TIERS = [10, 13, 17, 21, 25, 29, 33, 38, 41]
-FLOOR_BY_TIER = {10: 10, 13: 10, 17: 13, 21: 15, 25: 17, 29: 19, 33: 21, 38: 29, 41: 33}
+FLOOR_BY_TIER = {10: 10, 13: 10, 17: 12, 21: 14, 25: 17, 29: 19, 33: 21, 38: 29, 41: 33}
 
 # rank points set with a floor. kyu ranks (1..9) sit at 200 * rank; 1st dan (10) cannot be
 # demoted. above that a loss is -2000 and the gauge going below 0 demotes, so 5000 gives
