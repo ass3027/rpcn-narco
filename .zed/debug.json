@@ -7,12 +7,14 @@
     "label": "Build & Debug native binary",
     "build": {
       "command": "cargo",
-      "args": ["build"]
+      "args": ["build"],
+      "cwd": "$ZED_WORKTREE_ROOT/rpcn-narco",
     },
-    "program": "target/debug/rpcn",
+    "cwd": "$ZED_WORKTREE_ROOT\\rpcn-narco",
+    "program": "rpcn-narco/target/debug/rpcn",
     // sourceLanguages is required for CodeLLDB (not GDB) when using Rust
     "sourceLanguages": ["rust"],
     "request": "launch",
-    "adapter": "CodeLLDB"
+    "adapter": "CodeLLDB",
   }
 ]
