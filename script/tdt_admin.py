@@ -50,8 +50,8 @@ BACKUP_DIR = "/home/ec2-user/backup/tdt"
 ARCHIVE_DIR = "/home/ec2-user/backup/tdt_archive"
 AUDIT_LOG = "/home/ec2-user/backup/tdt/audit.jsonl"
 STAT_URL = "http://127.0.0.1:31314/rpcn_stats/usage"
-# rpcn.cfg의 ExternalUserApiKey와 같은 값. 없으면 접속 여부를 확인할 수 없다
-STAT_API_KEY = os.environ.get("RPCN_STAT_API_KEY", "")
+# rpcn-vpn-monitor 서비스의 EnvironmentFile. 환경변수가 없을 때 여기서 키를 읽는다
+STAT_ENV_FILE = "/etc/sysconfig/rpcn-vpn-monitor"
 
 CHAR_BASE, CHAR_STRIDE, CHAR_N = 0x70, 0x30, 59
 OFF_ACCOUNT_RANK, OFF_ACCOUNT_PROGRESS = 0x18, 0x1B
@@ -210,14 +210,30 @@ def lookup(npid):
     return uid, data_id, saved, os.path.join(TUS_DIR, f"{data_id:020d}.tdt")
 
 
+def stat_api_key():
+    """rpcn.cfg의 ExternalUserApiKey. RPCN_STAT_API_KEY 환경변수가 STAT_ENV_FILE보다 우선한다"""
+    key = os.environ.get("RPCN_STAT_API_KEY")
+    if key:
+        return key
+    try:
+        with open(STAT_ENV_FILE) as f:
+            for line in f:
+                name, sep, value = line.strip().partition("=")
+                if sep and name.strip() == "RPCN_STAT_API_KEY":
+                    return value.strip().strip("'\"")
+    except OSError as e:
+        print(f"  warn: cannot read {STAT_ENV_FILE}: {e.strerror}")
+    return ""
+
+
 def online():
-    req = urllib.request.Request(STAT_URL, headers={"X-API-Key": STAT_API_KEY})
+    req = urllib.request.Request(STAT_URL, headers={"X-API-Key": stat_api_key()})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         # 403/404는 서버 장애가 아니라 키 설정 문제다
-        print(f"  warn: stat server answered {e.code}; check RPCN_STAT_API_KEY")
+        print(f"  warn: stat server answered {e.code}; check RPCN_STAT_API_KEY in {STAT_ENV_FILE}")
         return None
     except Exception:
         return None

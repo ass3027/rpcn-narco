@@ -11,7 +11,7 @@ import requests
 
 
 STATS_URL = "http://127.0.0.1:31314/rpcn_stats/usage"
-# rpcn.cfg의 ExternalUserApiKey와 같은 값. 없으면 /usage가 403/404다
+# rpcn.cfg의 ExternalUserApiKey와 같은 값. systemd EnvironmentFile(/etc/sysconfig/rpcn-vpn-monitor)로 받는다
 STATS_API_KEY = os.environ.get("RPCN_STAT_API_KEY", "")
 RPCN_PORT = 31313
 ZONE = "public"
