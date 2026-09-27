@@ -171,7 +171,10 @@ impl Client {
 					friend_userids = rels.friends.iter().map(|v| (*v).clone()).collect();
 
 					info!("Authentified as {}", &self.client_info.npid);
-					client_infos.insert(self.client_info.user_id, ClientSharedInfo::new(friend_userids.clone(), self.channel_sender.clone()));
+					client_infos.insert(
+						self.client_info.user_id,
+						ClientSharedInfo::new(friend_userids.clone(), self.channel_sender.clone(), self.kick_notify.clone()),
+					);
 
 					self.shared.game_tracker.increase_num_users();
 				}
