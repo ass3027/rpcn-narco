@@ -85,6 +85,12 @@ impl Client {
 
 			match db.check_user(&login, &password, &token, self.config.read().is_email_validated()) {
 				Ok(user_data) => {
+					// 신규 ErrorType은 클라이언트 프로토콜과 호환되지 않아 기존 LoginError 사용
+					if user_data.banned {
+						warn!("Banned user {} attempted to log in", login);
+						return Err(ErrorType::LoginError);
+					}
+
 					// client_infos.write() serves as an exclusive lock to avoid multiple logins
 					let mut client_infos = self.shared.client_infos.write();
 
