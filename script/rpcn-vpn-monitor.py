@@ -11,6 +11,8 @@ import requests
 
 
 STATS_URL = "http://127.0.0.1:31314/rpcn_stats/usage"
+# rpcn.cfg의 ExternalUserApiKey와 같은 값. 없으면 /usage가 403/404다
+STATS_API_KEY = os.environ.get("RPCN_STAT_API_KEY", "")
 RPCN_PORT = 31313
 ZONE = "public"
 
@@ -60,7 +62,7 @@ def load_state():
 
 
 def get_players(session):
-    response = session.get(STATS_URL, timeout=5)
+    response = session.get(STATS_URL, headers={"X-API-Key": STATS_API_KEY}, timeout=5)
     response.raise_for_status()
 
     return {

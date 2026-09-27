@@ -5,6 +5,7 @@ use crate::server::client::ComId;
 use hyper::{Method, Request, Response};
 
 use super::StatContext;
+use super::auth::reject_without_api_key;
 use super::response::empty_response;
 use super::{external, rooms, score, usage};
 
@@ -22,8 +23,9 @@ pub(super) async fn route(req: Request<hyper::body::Incoming>, ctx: Arc<StatCont
 		return Ok(empty_response());
 	}
 
+	// Usage lists every connected player's IP, so it shares the external API key.
 	if sub_path == "/usage" {
-		return Ok(usage::handle_usage_req(&ctx));
+		return Ok(reject_without_api_key(&req, &ctx).unwrap_or_else(|| usage::handle_usage_req(&ctx)));
 	}
 
 	if let Some(com_id) = sub_path.strip_prefix("/rooms/").and_then(parse_com_id) {

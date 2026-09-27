@@ -50,6 +50,8 @@ BACKUP_DIR = "/home/ec2-user/backup/tdt"
 ARCHIVE_DIR = "/home/ec2-user/backup/tdt_archive"
 AUDIT_LOG = "/home/ec2-user/backup/tdt/audit.jsonl"
 STAT_URL = "http://127.0.0.1:31314/rpcn_stats/usage"
+# rpcn.cfg의 ExternalUserApiKey와 같은 값. 없으면 접속 여부를 확인할 수 없다
+STAT_API_KEY = os.environ.get("RPCN_STAT_API_KEY", "")
 
 CHAR_BASE, CHAR_STRIDE, CHAR_N = 0x70, 0x30, 59
 OFF_ACCOUNT_RANK, OFF_ACCOUNT_PROGRESS = 0x18, 0x1B
@@ -209,9 +211,14 @@ def lookup(npid):
 
 
 def online():
+    req = urllib.request.Request(STAT_URL, headers={"X-API-Key": STAT_API_KEY})
     try:
-        with urllib.request.urlopen(STAT_URL, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        # 403/404는 서버 장애가 아니라 키 설정 문제다
+        print(f"  warn: stat server answered {e.code}; check RPCN_STAT_API_KEY")
+        return None
     except Exception:
         return None
     out = set()

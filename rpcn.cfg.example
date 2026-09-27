@@ -24,7 +24,8 @@ StatServerHost=0.0.0.0
 StatServerPort=31314
 StatServerPath=rpcn_stats
 StatServerCacheLife=1
-# Shared secret required by POST /rpcn_stats/external/users/verify. Leave empty to disable the external user API.
+# Shared secret (X-API-Key header) required by GET /rpcn_stats/usage and POST /rpcn_stats/external/users/verify.
+# Leave empty to disable both routes.
 # Do not expose this HTTP server to the internet directly; place it behind an HTTPS reverse proxy.
 ExternalUserApiKey=
 # List of admin usernames, separated by a comma("AdminsList=yournickname,friendnickname")

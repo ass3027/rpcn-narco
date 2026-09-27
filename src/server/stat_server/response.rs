@@ -4,6 +4,10 @@ pub(super) fn json_response(status: StatusCode, body: String) -> Response<String
 	Response::builder().status(status).header("Content-Type", "application/json").body(body).unwrap()
 }
 
+pub(super) fn error_response(status: StatusCode, error: &str) -> Response<String> {
+	json_response(status, format!("{{\"error\":\"{}\"}}", error))
+}
+
 pub(super) fn empty_response() -> Response<String> {
 	Response::new("".to_owned())
 }

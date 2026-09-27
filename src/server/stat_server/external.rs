@@ -1,11 +1,11 @@
 use crate::server::database::{Database, DbError};
 use http_body_util::{BodyExt, Limited};
 use hyper::{Method, Request, Response, StatusCode};
-use openssl::memcmp;
 use serde::{Deserialize, Serialize};
 
 use super::StatContext;
-use super::response::json_response;
+use super::auth::reject_without_api_key;
+use super::response::{error_response, json_response};
 
 const MAX_BODY_SIZE: usize = 4096;
 
@@ -27,27 +27,13 @@ struct VerifyResponse {
 	banned: bool,
 }
 
-fn error_response(status: StatusCode, error: &str) -> Response<String> {
-	json_response(status, format!("{{\"error\":\"{}\"}}", error))
-}
-
 pub(super) async fn handle_verify_req(req: Request<hyper::body::Incoming>, ctx: &StatContext) -> Response<String> {
-	// An empty ExternalUserApiKey disables the API entirely.
-	let Some(api_key) = ctx.external_user_api_key.as_deref() else {
-		return Response::builder().status(StatusCode::NOT_FOUND).body("".to_owned()).unwrap();
-	};
+	if let Some(response) = reject_without_api_key(&req, ctx) {
+		return response;
+	}
 
 	if req.method() != Method::POST {
 		return error_response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
-	}
-
-	let is_authorized = req
-		.headers()
-		.get("X-API-Key")
-		.and_then(|value| value.to_str().ok())
-		.is_some_and(|value| value.len() == api_key.len() && memcmp::eq(value.as_bytes(), api_key.as_bytes()));
-	if !is_authorized {
-		return error_response(StatusCode::FORBIDDEN, "forbidden");
 	}
 
 	let Ok(body) = Limited::new(req.into_body(), MAX_BODY_SIZE).collect().await else {

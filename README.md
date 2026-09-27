@@ -59,6 +59,8 @@ Content-Type: application/json
 
 The response contains only `user_id`, `username`, `online_name`, `avatar_url`, `admin`, and `banned`. Invalid credentials always receive `401`, regardless of whether the username exists. The endpoint does not create a login session or issue a token.
 
+The same key also guards `GET /{StatServerPath}/usage`, because its `players_id` section lists every connected player's IP. Both routes answer `404` while `ExternalUserApiKey` is empty and `403` on a missing or wrong `X-API-Key`.
+
 This stat server is HTTP-only. Bind it to `127.0.0.1` and put an HTTPS reverse proxy in front of it before allowing external requests. Do not send passwords or the API key over an untrusted HTTP connection.
 
 # FAQ
