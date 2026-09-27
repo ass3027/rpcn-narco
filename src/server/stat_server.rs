@@ -1,3 +1,4 @@
+mod admin;
 mod auth;
 mod cache;
 mod external;
@@ -7,13 +8,14 @@ mod router;
 mod score;
 mod usage;
 
+use std::collections::HashMap;
 use std::io;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
 use crate::server::GameTracker;
 use crate::server::Server;
-use crate::server::client::TerminateWatch;
+use crate::server::client::{ClientSharedInfo, TerminateWatch};
 use crate::server::room_manager::RoomManager;
 use crate::server::score_cache::ScoresCache;
 use cache::JsonCache;
@@ -33,6 +35,7 @@ struct StatContext {
 	json_cache: JsonCache,
 	room_manager: Arc<RwLock<RoomManager>>,
 	db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+	client_infos: Arc<RwLock<HashMap<i64, ClientSharedInfo>>>,
 	external_user_api_key: Option<String>,
 }
 
@@ -49,6 +52,7 @@ impl Server {
 		game_tracker: Arc<GameTracker>,
 		room_manager: Arc<RwLock<RoomManager>>,
 		db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+		client_infos: Arc<RwLock<HashMap<i64, ClientSharedInfo>>>,
 	) -> io::Result<()> {
 		let (bind_addr, cache_life, path, external_user_api_key);
 		{
@@ -82,6 +86,7 @@ impl Server {
 				json_cache: JsonCache::new(),
 				room_manager,
 				db_pool,
+				client_infos,
 				external_user_api_key,
 			};
 			let mut stat_server = StatServer {

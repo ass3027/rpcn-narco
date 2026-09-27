@@ -7,16 +7,24 @@ use hyper::{Method, Request, Response};
 use super::StatContext;
 use super::auth::reject_without_api_key;
 use super::response::empty_response;
-use super::{external, rooms, score, usage};
+use super::{admin, external, rooms, score, usage};
 
 pub(super) async fn route(req: Request<hyper::body::Incoming>, ctx: Arc<StatContext>) -> Result<Response<String>, Infallible> {
 	let Some(sub_path) = req.uri().path().strip_prefix(ctx.path.as_str()) else {
 		return Ok(empty_response());
 	};
 
-	// The only route that accepts POST, so it is matched before the GET filter.
+	// POST routes are matched before the GET filter.
 	if sub_path == "/external/users/verify" {
 		return Ok(external::handle_verify_req(req, &ctx).await);
+	}
+
+	if sub_path == "/admin/users/info" {
+		return Ok(admin::handle_user_info_req(req, &ctx).await);
+	}
+
+	if sub_path == "/admin/users/ban" {
+		return Ok(admin::handle_ban_req(req, &ctx).await);
 	}
 
 	if req.method() != Method::GET {
