@@ -113,6 +113,12 @@ struct MigrationData {
 
 static DATABASE_PATH: &str = "db/rpcn.db";
 
+// 테스트용: 빈 DB(인메모리 등)에 파일 백업 없이 모든 migration을 적용한다
+#[cfg(test)]
+pub fn apply_migrations(conn: &r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>) -> Result<(), String> {
+	DATABASE_MIGRATIONS.iter().try_for_each(|mig| (mig.function)(conn))
+}
+
 static DATABASE_MIGRATIONS: [MigrationData; 11] = [
 	MigrationData {
 		version: 1,

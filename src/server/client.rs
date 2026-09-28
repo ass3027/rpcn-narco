@@ -14,6 +14,7 @@ mod ticket;
 pub mod notifications;
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -139,16 +140,23 @@ pub struct ClientSharedInfo {
 	pub session_info: RwLock<ClientSharedSessionInfo>,
 	pub channel: mpsc::Sender<Vec<u8>>,
 	kick_notify: Arc<Notify>,
+	// 악성 유저 ban을 위해 API 서버가 접속자 목록으로 노출한다
+	pub npid: String,
+	pub online_name: String,
+	pub ip: IpAddr,
 }
 
 impl ClientSharedInfo {
-	pub fn new(friends: HashMap<i64, String>, channel: mpsc::Sender<Vec<u8>>, kick_notify: Arc<Notify>) -> ClientSharedInfo {
+	pub fn new(friends: HashMap<i64, String>, channel: mpsc::Sender<Vec<u8>>, kick_notify: Arc<Notify>, client_info: &ClientInfo, ip: IpAddr) -> ClientSharedInfo {
 		ClientSharedInfo {
 			signaling_info: RwLock::new(ClientSharedSignalingInfo::new()),
 			friend_info: RwLock::new(ClientSharedFriendInfo::new(friends)),
 			session_info: RwLock::new(ClientSharedSessionInfo::new()),
 			channel,
 			kick_notify,
+			npid: client_info.npid.clone(),
+			online_name: client_info.online_name.clone(),
+			ip,
 		}
 	}
 
@@ -195,6 +203,7 @@ pub struct Client {
 	post_reply_notifications: Vec<Vec<u8>>,
 	terminate_watch: TerminateWatch,
 	kick_notify: Arc<Notify>,
+	peer_ip: IpAddr,
 	current_game: (Option<ComId>, Option<String>),
 }
 
@@ -404,6 +413,7 @@ impl Client {
 		db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
 		shared: SharedData,
 		terminate_watch: TerminateWatch,
+		peer_ip: IpAddr,
 	) -> (Client, io::ReadHalf<TlsStream<TcpStream>>) {
 		let client_info = ClientInfo {
 			user_id: 0,
@@ -440,6 +450,7 @@ impl Client {
 				post_reply_notifications: Vec::new(),
 				terminate_watch,
 				kick_notify: Arc::new(Notify::new()),
+				peer_ip,
 				current_game: (None, None),
 			},
 			tls_reader,
@@ -465,7 +476,6 @@ impl Client {
 
 		if let Some(ref cur_com_id) = client.current_game.0 {
 			client.shared.game_tracker.decrease_count_psn(cur_com_id);
-			client.shared.game_tracker.remove_player(cur_com_id, &client.client_info.online_name);
 			client.current_game.0 = None;
 		}
 
@@ -781,29 +791,15 @@ impl Client {
 		let com_id = data.get_com_id();
 		let final_com_id = self.config.read().get_server_redirection(com_id);
 
-		// IP 미리 추출
-		let ip_str = {
-			let client_infos = self.shared.client_infos.read();
-			if let Some(info) = client_infos.get(&self.client_info.user_id) {
-				let ip = info.signaling_info.read().addr_p2p_ipv4.0;
-				format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
-			} else {
-				String::from("0.0.0.0")
-			}
-		};
-
 		if let Some(ref mut cur_com_id) = self.current_game.0 {
 			if *cur_com_id != final_com_id {
 				self.shared.game_tracker.decrease_count_psn(cur_com_id);
-				self.shared.game_tracker.remove_player(cur_com_id, &self.client_info.online_name); // 추가
 				*cur_com_id = final_com_id;
 				self.shared.game_tracker.increase_count_psn(&final_com_id);
-				self.shared.game_tracker.add_player(&final_com_id, &self.client_info.online_name, &ip_str); // 추가
 			}
 		} else {
 			self.current_game.0 = Some(final_com_id);
 			self.shared.game_tracker.increase_count_psn(&final_com_id);
-			self.shared.game_tracker.add_player(&final_com_id, &self.client_info.online_name, &ip_str); // 추가
 		}
 
 		final_com_id

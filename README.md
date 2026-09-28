@@ -43,25 +43,25 @@ RPCN is a server that implements multiplayer functionality for RPCS3.
 It implements rooms which permit matchmaking, scoreboards, title user storage(ie cloud saves), etc.  
 All the settings and their descriptions are in rpcn.cfg.
 
-## External user verification API
+## API server
 
-When `StatServer=true` and `ExternalUserApiKey` is set in `rpcn.cfg`, the stat server exposes a password-verification endpoint for trusted service integration:
+The fork's own HTTP API runs separately from the upstream stat server, on its own port, when `ApiServer=true` in `rpcn.cfg`. The stat server stays identical to upstream.
 
-```text
-POST /{StatServerPath}/external/users/verify
-X-API-Key: {ExternalUserApiKey}
-Content-Type: application/json
-```
+| Route | Auth | Purpose |
+|---|---|---|
+| `GET /admin/sessions` | API key | Logged-in users as `{"sessions": [{"online_name", "npid", "ip"}]}`. Find a player by the in-game `online_name`, ban by `npid` |
+| `POST /external/users/verify` | API key | Check a username/password for trusted service integration |
+| `POST /admin/users/info` | API key + admin account | Look up a user |
+| `POST /admin/users/ban` | API key + admin account | Ban a user and disconnect them if online |
+| `GET /rooms/{com_id}` | none | Rooms of a game |
 
-```json
-{"username":"example_user","password":"example_password"}
-```
+Keyed routes take the `X-API-Key: {ApiServerApiKey}` header. They answer `404` while `ApiServerApiKey` is empty and `403` on a missing or wrong key. Errors are `{"error": "<code>"}`.
 
-The response contains only `user_id`, `username`, `online_name`, `avatar_url`, `admin`, and `banned`. Invalid credentials always receive `401`, regardless of whether the username exists. The endpoint does not create a login session or issue a token.
+`/external/users/verify` takes `{"username": ..., "password": ...}` (`id`/`pw` also accepted) and returns only `user_id`, `username`, `online_name`, `avatar_url`, `admin`, and `banned`. Invalid credentials always receive `401`, regardless of whether the username exists. It does not create a login session or issue a token.
 
-The same key also guards `GET /{StatServerPath}/usage`, because its `players_id` section lists every connected player's IP. Both routes answer `404` while `ExternalUserApiKey` is empty and `403` on a missing or wrong `X-API-Key`.
+The admin routes take `{"admin_username", "admin_password", "username"}`. The admin account must be an admin and not banned.
 
-This stat server is HTTP-only. Bind it to `127.0.0.1` and put an HTTPS reverse proxy in front of it before allowing external requests. Do not send passwords or the API key over an untrusted HTTP connection.
+This server is HTTP-only. Bind it to `127.0.0.1` and put an HTTPS reverse proxy in front of it before allowing external requests. Do not send passwords or the API key over an untrusted HTTP connection.
 
 # FAQ
 
