@@ -298,12 +298,21 @@ def take_backup(npid, path, label=None):
     return dst
 
 
+def online_or_stop(force):
+    """접속자 목록. 확인할 수 없으면 --force 없이는 아무것도 쓰지 않는다"""
+    who = online()
+    if who is not None:
+        return who
+    if not force:
+        die("stat server unreachable, cannot check online status. "
+            "Nothing was written. Fix the stat server, or pass --force.")
+    print("  warn: stat server unreachable and --force was given")
+    return set()
+
+
 def guard_online(npid, force, who=None):
     if who is None:
-        who = online()
-    if who is None:
-        print("  warn: stat server unreachable, cannot check online status")
-        return
+        who = online_or_stop(force)
     if npid in who:
         if not force:
             die(f"{npid} is online right now. The game would overwrite this edit "
@@ -662,9 +671,12 @@ def cmd_floor(a):
         die("give one or more npids, or --all")
 
     # 접속자 조회는 한 번만 한다. 계정마다 부르면 stat 서버 장애 시 계정 수만큼 대기한다
-    who = online()
-    if who is None:
-        print("  warn: stat server unreachable, cannot check online status")
+    # dry run은 쓰지 않으므로 stat 서버가 죽어도 멈추지 않고 보고서를 끝까지 보여준다
+    who = online() if a.dry_run else online_or_stop(a.force)
+    online_unknown = who is None
+    if online_unknown:
+        print("  warn: stat server unreachable. Online accounts cannot be told apart, "
+              "and the real run will stop unless --force is given.")
         who = set()
     label = a.label or "pre-floor-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f"{len(names)} accounts, floor {a.rank if a.rank is not None else 'auto'}, "
@@ -699,7 +711,7 @@ def cmd_floor(a):
             failed += 1
 
     print(f"{'would apply' if a.dry_run else 'applied'} {done}  slots {chars:,}  "
-          f"no change {nochange}  online {online_skip}  failed {failed}")
+          f"no change {nochange}  online {'unknown' if online_unknown else online_skip}  failed {failed}")
     if not a.dry_run and len(names) > 1:
         audit("floor-batch", "-", accounts=done, slots=chars, label=label, rank=a.rank,
               skipped_online=online_skip, failed=failed)
