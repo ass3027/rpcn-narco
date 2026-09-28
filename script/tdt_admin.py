@@ -64,18 +64,10 @@ TIERS = [10, 13, 17, 21, 25, 29, 33, 38, 41]
 
 FLOOR_POINTS = {r: 200 * r for r in range(1, 10)}
 FLOOR_POINTS[10] = 0
-_P10 = {11: 2531, 12: 2735, 13: 2300, 14: 3112, 15: 2907, 16: 2799,
-        17: 5993, 18: 1562, 19: 1964, 21: 2679}
-for _r in range(11, 43):
-    if _r in _P10:
-        FLOOR_POINTS[_r] = _P10[_r]
-    else:
-        _lo = max([k for k in _P10 if k < _r], default=None)
-        _hi = min([k for k in _P10 if k > _r], default=None)
-        if _lo is not None and _hi is not None:
-            FLOOR_POINTS[_r] = int(round(_P10[_lo] + (_r - _lo) / (_hi - _lo) * (_P10[_hi] - _P10[_lo])))
-        else:
-            FLOOR_POINTS[_r] = _P10[_lo if _lo is not None else _hi]
+# 올린 캐릭터가 몇 판 만에 다시 강등되지 않도록 넉넉한 점수를 준다
+ORANGE_TIER = 25  # Vanquisher, 주황단 시작
+FLOOR_POINTS.update({r: 5000 for r in range(11, ORANGE_TIER)})
+FLOOR_POINTS.update({r: 7000 for r in range(ORANGE_TIER, 43)})
 
 # --------------------------------------------------------------- checksum
 P = 0x1DB710641
