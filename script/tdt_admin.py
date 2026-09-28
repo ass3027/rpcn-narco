@@ -49,7 +49,7 @@ TUS_DIR = "/home/ec2-user/rpcn-data/tus_data"
 BACKUP_DIR = "/home/ec2-user/backup/tdt"
 ARCHIVE_DIR = "/home/ec2-user/backup/tdt_archive"
 AUDIT_LOG = "/home/ec2-user/backup/tdt/audit.jsonl"
-STAT_URL = "http://127.0.0.1:31314/rpcn_stats/usage"
+STAT_URL = "http://127.0.0.1:31315/admin/sessions"
 # rpcn-vpn-monitor 서비스의 EnvironmentFile. 환경변수가 없을 때 여기서 키를 읽는다
 STAT_ENV_FILE = "/etc/sysconfig/rpcn-vpn-monitor"
 
@@ -203,7 +203,7 @@ def lookup(npid):
 
 
 def stat_api_key():
-    """rpcn.cfg의 ExternalUserApiKey. RPCN_STAT_API_KEY 환경변수가 STAT_ENV_FILE보다 우선한다"""
+    """rpcn.cfg의 ApiServerApiKey. RPCN_STAT_API_KEY 환경변수가 STAT_ENV_FILE보다 우선한다"""
     key = os.environ.get("RPCN_STAT_API_KEY")
     if key:
         return key
@@ -219,20 +219,18 @@ def stat_api_key():
 
 
 def online():
+    """접속 중인 계정의 npid(username) 집합. 세이브를 username으로 찾으므로 online_name이 아니라 npid로 비교한다"""
     req = urllib.request.Request(STAT_URL, headers={"X-API-Key": stat_api_key()})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         # 403/404는 서버 장애가 아니라 키 설정 문제다
-        print(f"  warn: stat server answered {e.code}; check RPCN_STAT_API_KEY in {STAT_ENV_FILE}")
+        print(f"  warn: API server answered {e.code}; check RPCN_STAT_API_KEY in {STAT_ENV_FILE}")
         return None
     except Exception:
         return None
-    out = set()
-    for players in data.get("players_id", {}).values():
-        out.update(players.keys())
-    return out
+    return {s["npid"] for s in data["sessions"]}
 
 
 def read_save(path):
@@ -296,9 +294,9 @@ def online_or_stop(force):
     if who is not None:
         return who
     if not force:
-        die("stat server unreachable, cannot check online status. "
-            "Nothing was written. Fix the stat server, or pass --force.")
-    print("  warn: stat server unreachable and --force was given")
+        die("API server unreachable, cannot check online status. "
+            "Nothing was written. Fix the API server, or pass --force.")
+    print("  warn: API server unreachable and --force was given")
     return set()
 
 
@@ -662,12 +660,12 @@ def cmd_floor(a):
     if not names:
         die("give one or more npids, or --all")
 
-    # 접속자 조회는 한 번만 한다. 계정마다 부르면 stat 서버 장애 시 계정 수만큼 대기한다
-    # dry run은 쓰지 않으므로 stat 서버가 죽어도 멈추지 않고 보고서를 끝까지 보여준다
+    # 접속자 조회는 한 번만 한다. 계정마다 부르면 API 서버 장애 시 계정 수만큼 대기한다
+    # dry run은 쓰지 않으므로 API 서버가 죽어도 멈추지 않고 보고서를 끝까지 보여준다
     who = online() if a.dry_run else online_or_stop(a.force)
     online_unknown = who is None
     if online_unknown:
-        print("  warn: stat server unreachable. Online accounts cannot be told apart, "
+        print("  warn: API server unreachable. Online accounts cannot be told apart, "
               "and the real run will stop unless --force is given.")
         who = set()
     label = a.label or "pre-floor-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S")

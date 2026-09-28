@@ -10,8 +10,8 @@ from logging.handlers import TimedRotatingFileHandler
 import requests
 
 
-STATS_URL = "http://127.0.0.1:31314/rpcn_stats/usage"
-# rpcn.cfg의 ExternalUserApiKey와 같은 값. systemd EnvironmentFile(/etc/sysconfig/rpcn-vpn-monitor)로 받는다
+SESSIONS_URL = "http://127.0.0.1:31315/admin/sessions"
+# rpcn.cfg의 ApiServerApiKey와 같은 값. systemd EnvironmentFile(/etc/sysconfig/rpcn-vpn-monitor)로 받는다
 STATS_API_KEY = os.environ.get("RPCN_STAT_API_KEY", "")
 RPCN_PORT = 31313
 ZONE = "public"
@@ -62,13 +62,13 @@ def load_state():
 
 
 def get_players(session):
-    response = session.get(STATS_URL, headers={"X-API-Key": STATS_API_KEY}, timeout=5)
+    """접속 중인 (online_name, npid, ip). ban은 npid로 하므로 게임에 보이는 이름과 함께 남긴다"""
+    response = session.get(SESSIONS_URL, headers={"X-API-Key": STATS_API_KEY}, timeout=5)
     response.raise_for_status()
 
     return {
-        (name, str(ipaddress.ip_address(ip.strip())))
-        for players in response.json().get("players_id", {}).values()
-        for name, ip in players.items()
+        (s["online_name"], s["npid"], str(ipaddress.ip_address(s["ip"])))
+        for s in response.json()["sessions"]
     }
 
 
@@ -140,22 +140,19 @@ def block_ip(ip):
 
 def monitor_once(session, checked_ips, next_lookup_at):
     players = get_players(session)
-    unknown_ips = sorted({
-        ip for _, ip in players
-        if ip not in checked_ips and ip != "0.0.0.0"
-    })
+    unknown_ips = sorted({ip for _, _, ip in players if ip not in checked_ips})
 
     for ip in unknown_ips[:MAX_LOOKUPS_PER_CYCLE]:
-        player_ids = sorted(
-            player_id for player_id, address in players
+        accounts = sorted(
+            (online_name, npid) for online_name, npid, address in players
             if address == ip
         )
         blocked, data, next_lookup_at = is_vpn(session, ip, next_lookup_at)
 
         logger.info(
-            "IP=%s 계정=%s 국가=%s ISP=%s 차단대상=%s",
+            "IP=%s 계정(online_name, npid)=%s 국가=%s ISP=%s 차단대상=%s",
             ip,
-            player_ids,
+            accounts,
             data.get("country", "unknown"),
             data.get("isp", "unknown"),
             blocked,
@@ -163,11 +160,11 @@ def monitor_once(session, checked_ips, next_lookup_at):
 
         if blocked:
             block_ip(ip)
-            logger.warning("IP 차단 처리: %s 계정=%s", ip, player_ids)
+            logger.warning("IP 차단 처리: %s 계정(online_name, npid)=%s", ip, accounts)
 
         append_record({
             "ip": ip,
-            "player_ids": player_ids,
+            "accounts": [{"online_name": n, "npid": p} for n, p in accounts],
             "blocked": blocked,
         })
         checked_ips.add(ip)
