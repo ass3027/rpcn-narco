@@ -54,6 +54,9 @@ impl Client {
 			Ok(user_id) => match db.ban_user(user_id) {
 				Ok(()) => {
 					warn!("Successfully banned user {}", username);
+					if let Some(client_info) = self.shared.client_infos.read().get(&user_id) {
+						client_info.kick();
+					}
 					Ok(ErrorType::NoError)
 				}
 				Err(e) => {

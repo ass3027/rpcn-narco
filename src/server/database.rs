@@ -47,6 +47,17 @@ impl std::fmt::Display for DbError {
 	}
 }
 
+pub struct UserAdminInfo {
+	pub user_id: i64,
+	pub username: String,
+	pub online_name: String,
+	pub avatar_url: String,
+	pub admin: bool,
+	pub banned: bool,
+	pub creation: Option<u64>,
+	pub last_login: Option<u64>,
+}
+
 #[allow(dead_code)]
 pub struct UserQueryResult {
 	pub user_id: i64,
@@ -101,6 +112,12 @@ struct MigrationData {
 }
 
 static DATABASE_PATH: &str = "db/rpcn.db";
+
+// 테스트용: 빈 DB(인메모리 등)에 파일 백업 없이 모든 migration을 적용한다
+#[cfg(test)]
+pub fn apply_migrations(conn: &r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>) -> Result<(), String> {
+	DATABASE_MIGRATIONS.iter().try_for_each(|mig| (mig.function)(conn))
+}
 
 static DATABASE_MIGRATIONS: [MigrationData; 11] = [
 	MigrationData {
@@ -1375,6 +1392,33 @@ impl Database {
 			DbError::Internal
 		})?;
 		Ok(())
+	}
+
+	pub fn get_user_admin_info(&self, username: &str) -> Result<UserAdminInfo, DbError> {
+		let res = self.conn.query_row(
+			"SELECT a.user_id, a.username, a.online_name, a.avatar_url, a.admin, a.banned, t.creation, t.last_login FROM account a LEFT JOIN account_timestamp t ON a.user_id = t.user_id WHERE a.username = ?1",
+			rusqlite::params![username],
+			|r| {
+				Ok(UserAdminInfo {
+					user_id: r.get(0)?,
+					username: r.get(1)?,
+					online_name: r.get(2)?,
+					avatar_url: r.get(3)?,
+					admin: r.get(4)?,
+					banned: r.get(5)?,
+					creation: r.get(6)?,
+					last_login: r.get(7)?,
+				})
+			},
+		);
+
+		res.map_err(|e| {
+			if e == rusqlite::Error::QueryReturnedNoRows {
+				return DbError::Empty;
+			}
+			error!("Unexpected error querying user admin info: {}", e);
+			DbError::Internal
+		})
 	}
 
 	pub fn update_login_time(&self, user_id: i64) -> Result<(), DbError> {

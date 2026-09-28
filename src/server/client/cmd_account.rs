@@ -85,6 +85,12 @@ impl Client {
 
 			match db.check_user(&login, &password, &token, self.config.read().is_email_validated()) {
 				Ok(user_data) => {
+					// 신규 ErrorType은 클라이언트 프로토콜과 호환되지 않아 기존 LoginError 사용
+					if user_data.banned {
+						warn!("Banned user {} attempted to log in", login);
+						return Err(ErrorType::LoginError);
+					}
+
 					// client_infos.write() serves as an exclusive lock to avoid multiple logins
 					let mut client_infos = self.shared.client_infos.write();
 
@@ -165,7 +171,10 @@ impl Client {
 					friend_userids = rels.friends.iter().map(|v| (*v).clone()).collect();
 
 					info!("Authentified as {}", &self.client_info.npid);
-					client_infos.insert(self.client_info.user_id, ClientSharedInfo::new(friend_userids.clone(), self.channel_sender.clone()));
+					client_infos.insert(
+						self.client_info.user_id,
+						ClientSharedInfo::new(friend_userids.clone(), self.channel_sender.clone(), self.kick_notify.clone(), &self.client_info, self.peer_ip),
+					);
 
 					self.shared.game_tracker.increase_num_users();
 				}

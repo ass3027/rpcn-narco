@@ -51,7 +51,9 @@ TUS_DIR = "/home/ec2-user/rpcn-data/tus_data"
 BACKUP_DIR = "/home/ec2-user/backup/tdt"
 ARCHIVE_DIR = "/home/ec2-user/backup/tdt_archive"
 AUDIT_LOG = "/home/ec2-user/backup/tdt/audit.jsonl"
-STAT_URL = "http://127.0.0.1:31314/rpcn_stats/usage"
+STAT_URL = "http://127.0.0.1:31315/admin/sessions"
+# rpcn-vpn-monitor 서비스의 EnvironmentFile. 환경변수가 없을 때 여기서 키를 읽는다
+STAT_ENV_FILE = "/etc/sysconfig/rpcn-vpn-monitor"
 
 CHAR_BASE, CHAR_STRIDE, CHAR_N = 0x70, 0x30, 59
 OFF_ACCOUNT_RANK, OFF_ACCOUNT_PROGRESS = 0x18, 0x1B
@@ -71,7 +73,10 @@ FLOOR_BY_TIER = {10: 10, 13: 10, 17: 12, 21: 14, 25: 17, 29: 19, 33: 21, 38: 29,
 # 3000 after one loss, 1000 (next loss demotes) after two, and demotion on the third.
 FLOOR_POINTS = {r: 200 * r for r in range(1, 10)}
 FLOOR_POINTS[10] = 0
-FLOOR_POINTS.update({r: 5000 for r in range(11, 43)})
+# 올린 캐릭터가 몇 판 만에 다시 강등되지 않도록 넉넉한 점수를 준다
+ORANGE_TIER = 25  # Vanquisher, 주황단 시작
+FLOOR_POINTS.update({r: 5000 for r in range(11, ORANGE_TIER)})
+FLOOR_POINTS.update({r: 7000 for r in range(ORANGE_TIER, 43)})
 
 # --------------------------------------------------------------- checksum
 P = 0x1DB710641
@@ -206,16 +211,35 @@ def lookup(npid):
     return uid, data_id, saved, os.path.join(TUS_DIR, f"{data_id:020d}.tdt")
 
 
-def online():
+def stat_api_key():
+    """rpcn.cfg의 ApiServerApiKey. RPCN_STAT_API_KEY 환경변수가 STAT_ENV_FILE보다 우선한다"""
+    key = os.environ.get("RPCN_STAT_API_KEY")
+    if key:
+        return key
     try:
-        with urllib.request.urlopen(STAT_URL, timeout=5) as r:
+        with open(STAT_ENV_FILE) as f:
+            for line in f:
+                name, sep, value = line.strip().partition("=")
+                if sep and name.strip() == "RPCN_STAT_API_KEY":
+                    return value.strip().strip("'\"")
+    except OSError as e:
+        print(f"  warn: cannot read {STAT_ENV_FILE}: {e.strerror}")
+    return ""
+
+
+def online():
+    """접속 중인 계정의 npid(username) 집합. 세이브를 username으로 찾으므로 online_name이 아니라 npid로 비교한다"""
+    req = urllib.request.Request(STAT_URL, headers={"X-API-Key": stat_api_key()})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        # 403/404는 서버 장애가 아니라 키 설정 문제다
+        print(f"  warn: API server answered {e.code}; check RPCN_STAT_API_KEY in {STAT_ENV_FILE}")
+        return None
     except Exception:
         return None
-    out = set()
-    for players in data.get("players_id", {}).values():
-        out.update(players.keys())
-    return out
+    return {s["npid"] for s in data["sessions"]}
 
 
 def read_save(path):
@@ -273,12 +297,21 @@ def take_backup(npid, path, label=None):
     return dst
 
 
+def online_or_stop(force):
+    """접속자 목록. 확인할 수 없으면 --force 없이는 아무것도 쓰지 않는다"""
+    who = online()
+    if who is not None:
+        return who
+    if not force:
+        die("API server unreachable, cannot check online status. "
+            "Nothing was written. Fix the API server, or pass --force.")
+    print("  warn: API server unreachable and --force was given")
+    return set()
+
+
 def guard_online(npid, force, who=None):
     if who is None:
-        who = online()
-    if who is None:
-        print("  warn: stat server unreachable, cannot check online status")
-        return
+        who = online_or_stop(force)
     if npid in who:
         if not force:
             die(f"{npid} is online right now. The game would overwrite this edit "
@@ -826,10 +859,13 @@ def cmd_floor(a):
     if not names:
         die("give one or more npids, or --all")
 
-    # 접속자 조회는 한 번만 한다. 계정마다 부르면 stat 서버 장애 시 계정 수만큼 대기한다
-    who = online()
-    if who is None:
-        print("  warn: stat server unreachable, cannot check online status")
+    # 접속자 조회는 한 번만 한다. 계정마다 부르면 API 서버 장애 시 계정 수만큼 대기한다
+    # dry run은 쓰지 않으므로 API 서버가 죽어도 멈추지 않고 보고서를 끝까지 보여준다
+    who = online() if a.dry_run else online_or_stop(a.force)
+    online_unknown = who is None
+    if online_unknown:
+        print("  warn: API server unreachable. Online accounts cannot be told apart, "
+              "and the real run will stop unless --force is given.")
         who = set()
     label = a.label or "pre-floor-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f"{len(names)} accounts, floor {a.rank if a.rank is not None else 'auto'}, "

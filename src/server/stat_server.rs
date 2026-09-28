@@ -6,45 +6,20 @@ use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response};
+use hyper_util::rt::TokioIo;
+use parking_lot::Mutex;
+use tokio::net::TcpListener;
+use tracing::{info, warn};
+
 use crate::Client;
 use crate::server::GameTracker;
 use crate::server::Server;
 use crate::server::client::{COMMUNICATION_ID_SIZE, ComId, TerminateWatch, com_id_to_string};
 use crate::server::database::db_score::DbBoardInfo;
-use crate::server::database::{Database, DbError};
-use crate::server::room_manager::RoomManager;
 use crate::server::score_cache::{GetScoreResultCache, ScoresCache};
-use http_body_util::{BodyExt, Limited};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
-use openssl::memcmp;
-use parking_lot::Mutex;
-use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
-use tracing::{info, warn};
-
-const EXTERNAL_USER_API_MAX_BODY_SIZE: usize = 4096;
-
-#[derive(Deserialize)]
-struct ExternalUserVerifyRequest {
-	#[serde(alias = "id")]
-	username: String,
-	#[serde(alias = "pw")]
-	password: String,
-}
-
-#[derive(Serialize)]
-struct ExternalUserVerifyResponse {
-	user_id: i64,
-	username: String,
-	online_name: String,
-	avatar_url: String,
-	admin: bool,
-	banned: bool,
-}
 
 struct CachedResponse {
 	timestamp: AtomicU32,
@@ -96,9 +71,6 @@ pub struct StatServer {
 	game_tracker: Arc<GameTracker>,
 	score_cache: Arc<ScoresCache>,
 	json_cache: Arc<JsonCache>,
-	room_manager: Arc<RwLock<RoomManager>>,
-	db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
-	external_user_api_key: Option<String>,
 }
 
 fn sanitize_for_json(s: &str) -> String {
@@ -115,20 +87,13 @@ fn sanitize_for_json(s: &str) -> String {
 }
 
 impl Server {
-	pub async fn start_stat_server(
-		&self,
-		term_watch: TerminateWatch,
-		game_tracker: Arc<GameTracker>,
-		room_manager: Arc<RwLock<RoomManager>>,
-		db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
-	) -> io::Result<()> {
-		let (bind_addr, cache_life, path, external_user_api_key);
+	pub async fn start_stat_server(&self, term_watch: TerminateWatch, game_tracker: Arc<GameTracker>) -> io::Result<()> {
+		let (bind_addr, cache_life, path);
 		{
 			let config = self.config.read();
 			bind_addr = config.get_stat_server_binds().clone();
 			cache_life = config.get_stat_server_cache_life();
 			path = format!("/{}", config.get_stat_server_path());
-			external_user_api_key = (!config.get_external_user_api_key().is_empty()).then(|| config.get_external_user_api_key().to_owned());
 		}
 
 		let score_cache = self.score_cache.clone();
@@ -148,7 +113,7 @@ impl Server {
 
 			info!("Stat server now waiting for connections on {}", str_addr);
 
-			let mut stat_server = StatServer::new(listener, term_watch, path, cache_life, game_tracker, score_cache, room_manager, db_pool, external_user_api_key);
+			let mut stat_server = StatServer::new(listener, term_watch, path, cache_life, game_tracker, score_cache);
 
 			tokio::task::spawn(async move {
 				stat_server.server_proc().await;
@@ -160,17 +125,7 @@ impl Server {
 }
 
 impl StatServer {
-	fn new(
-		listener: TcpListener,
-		term_watch: TerminateWatch,
-		path: String,
-		cache_life: u32,
-		game_tracker: Arc<GameTracker>,
-		score_cache: Arc<ScoresCache>,
-		room_manager: Arc<RwLock<RoomManager>>,
-		db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
-		external_user_api_key: Option<String>,
-	) -> StatServer {
+	fn new(listener: TcpListener, term_watch: TerminateWatch, path: String, cache_life: u32, game_tracker: Arc<GameTracker>, score_cache: Arc<ScoresCache>) -> StatServer {
 		StatServer {
 			listener,
 			term_watch,
@@ -179,9 +134,6 @@ impl StatServer {
 			game_tracker,
 			score_cache,
 			json_cache: Arc::new(JsonCache::new()),
-			room_manager,
-			db_pool,
-			external_user_api_key,
 		}
 	}
 
@@ -208,12 +160,9 @@ impl StatServer {
 						let game_tracker = self.game_tracker.clone();
 						let score_cache = self.score_cache.clone();
 						let json_cache = self.json_cache.clone();
-						let room_manager = self.room_manager.clone();
-						let db_pool = self.db_pool.clone();
-						let external_user_api_key = self.external_user_api_key.clone();
 
 						tokio::task::spawn(async move {
-							if let Err(err) = http1::Builder::new().keep_alive(false).serve_connection(io, service_fn(|r| StatServer::handle_stat_server_req(r, &path, cache_life, game_tracker.clone(), score_cache.clone(), json_cache.clone(), room_manager.clone(), db_pool.clone(), external_user_api_key.clone()))).await {
+							if let Err(err) = http1::Builder::new().keep_alive(false).serve_connection(io, service_fn(|r| StatServer::handle_stat_server_req(r, &path, cache_life, game_tracker.clone(), score_cache.clone(), json_cache.clone()))).await {
 								warn!("Stat: Error serving connection: {}", err);
 							}
 						});
@@ -329,60 +278,6 @@ impl StatServer {
 		Ok(Response::new("".to_owned()))
 	}
 
-	fn json_response(status: StatusCode, body: String) -> Response<String> {
-		Response::builder().status(status).header("Content-Type", "application/json").body(body).unwrap()
-	}
-
-	async fn handle_external_user_verify_req(
-		req: Request<hyper::body::Incoming>,
-		external_user_api_key: &str,
-		db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
-	) -> Result<Response<String>, Infallible> {
-		if req.method() != Method::POST {
-			return Ok(StatServer::json_response(StatusCode::METHOD_NOT_ALLOWED, "{\"error\":\"method_not_allowed\"}".to_owned()));
-		}
-
-		let is_authorized = req
-			.headers()
-			.get("X-API-Key")
-			.and_then(|value| value.to_str().ok())
-			.is_some_and(|value| value.len() == external_user_api_key.len() && memcmp::eq(value.as_bytes(), external_user_api_key.as_bytes()));
-		if !is_authorized {
-			return Ok(StatServer::json_response(StatusCode::FORBIDDEN, "{\"error\":\"forbidden\"}".to_owned()));
-		}
-
-		let body = match Limited::new(req.into_body(), EXTERNAL_USER_API_MAX_BODY_SIZE).collect().await {
-			Ok(body) => body.to_bytes(),
-			Err(_) => return Ok(StatServer::json_response(StatusCode::BAD_REQUEST, "{\"error\":\"invalid_request\"}".to_owned())),
-		};
-		let request: ExternalUserVerifyRequest = match serde_json::from_slice::<ExternalUserVerifyRequest>(&body) {
-			Ok(request) if !request.username.is_empty() && !request.password.is_empty() => request,
-			_ => return Ok(StatServer::json_response(StatusCode::BAD_REQUEST, "{\"error\":\"invalid_request\"}".to_owned())),
-		};
-
-		let verification = tokio::task::spawn_blocking(move || {
-			let connection = db_pool.get().map_err(|_| DbError::Internal)?;
-			Database::new(connection).check_user(&request.username, &request.password, "", false)
-		})
-		.await;
-
-		match verification {
-			Ok(Ok(user)) => {
-				let response = ExternalUserVerifyResponse {
-					user_id: user.user_id,
-					username: user.username,
-					online_name: user.online_name,
-					avatar_url: user.avatar_url,
-					admin: user.admin,
-					banned: user.banned,
-				};
-				Ok(StatServer::json_response(StatusCode::OK, serde_json::to_string(&response).unwrap()))
-			}
-			Ok(Err(DbError::Empty | DbError::WrongPass)) => Ok(StatServer::json_response(StatusCode::UNAUTHORIZED, "{\"error\":\"invalid_credentials\"}".to_owned())),
-			Ok(Err(_)) | Err(_) => Ok(StatServer::json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"internal_error\"}".to_owned())),
-		}
-	}
-
 	async fn handle_stat_server_req(
 		req: Request<hyper::body::Incoming>,
 		path: &str,
@@ -390,37 +285,17 @@ impl StatServer {
 		game_tracker: Arc<GameTracker>,
 		score_cache: Arc<ScoresCache>,
 		json_cache: Arc<JsonCache>,
-		room_manager: Arc<RwLock<RoomManager>>,
-		db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
-		external_user_api_key: Option<String>,
 	) -> Result<Response<String>, Infallible> {
-		let req_path = req.uri().path();
-		let external_user_verify_path = format!("{}/external/users/verify", path);
-		if req_path == external_user_verify_path {
-			if let Some(external_user_api_key) = external_user_api_key {
-				return StatServer::handle_external_user_verify_req(req, &external_user_api_key, db_pool).await;
-			}
-			return Ok(Response::builder().status(StatusCode::NOT_FOUND).body("".to_owned()).unwrap());
-		}
-
 		if req.method() != Method::GET {
 			return Ok(Response::new("".to_owned()));
 		}
 
+		let req_path = req.uri().path();
 		let usage_path = format!("{}/usage", path);
 		let score_prefix = format!("{}/score/", path);
-		let rooms_prefix = format!("{}/rooms/", path);
 
 		if req_path == usage_path {
 			return StatServer::handle_usage_req(cache_life, &game_tracker, &json_cache);
-		}
-
-		if let Some(com_id_str) = req_path.strip_prefix(&rooms_prefix) {
-			if com_id_str.len() == COMMUNICATION_ID_SIZE {
-				let mut com_id: ComId = [0u8; COMMUNICATION_ID_SIZE];
-				com_id.copy_from_slice(com_id_str.as_bytes());
-				return StatServer::handle_rooms_req(&room_manager, &com_id);
-			}
 		}
 
 		if let Some(rest) = req_path.strip_prefix(&score_prefix) {
@@ -505,27 +380,6 @@ impl StatServer {
 		add_games_with_hints(&mut res, "psn_games", &psn_games);
 		add_games(&mut res, "ticket_games", &ticket_games);
 
-		let psn_games_read = game_tracker.psn_games.read();
-		let has_players = psn_games_read.values().any(|g| !g.players.read().is_empty());
-
-		if has_players {
-			let _ = writeln!(res, ",\n    \"players_id\": {{");
-			let entries: Vec<_> = psn_games_read.iter().filter(|(_, g)| !g.players.read().is_empty()).collect();
-
-			for (index, (com_id, game_info)) in entries.iter().enumerate() {
-				let com_id_str = com_id_to_string(com_id);
-				let _ = writeln!(res, "        \"{}\": {{", com_id_str);
-				let players = game_info.players.read();
-				for (i, (name, ip)) in players.iter().enumerate() {
-					let comma = if i != players.len() - 1 { "," } else { "" };
-					let _ = write!(res, "            \"{}\": \"{}\"{}", sanitize_for_json(name), ip, comma);
-					res += "\n";
-				}
-				res += if index != entries.len() - 1 { "        },\n" } else { "        }\n" };
-			}
-			res += "    }";
-		}
-
 		res += "\n}";
 
 		res
@@ -571,56 +425,6 @@ impl StatServer {
 		}
 
 		res += "    ]\n}";
-		res
-	}
-
-	fn handle_rooms_req(room_manager: &Arc<RwLock<RoomManager>>, com_id: &ComId) -> Result<Response<String>, Infallible> {
-		let json = StatServer::rooms_to_json(room_manager, com_id);
-		Ok(Response::builder().header("Content-Type", "application/json").body(json).unwrap())
-	}
-
-	fn rooms_to_json(room_manager: &Arc<RwLock<RoomManager>>, com_id: &ComId) -> String {
-		let rm = room_manager.read();
-		let mut res = String::from("[\n");
-		let mut first_room = true;
-
-		for ((c_id, room_id), room) in rm.get_rooms() {
-			if c_id != com_id {
-				continue;
-			}
-
-			if !first_room {
-				res += ",\n";
-			}
-			first_room = false;
-
-			let _ = writeln!(res, "  {{");
-			let _ = writeln!(res, "    \"room_id\": {},", room_id);
-			let _ = writeln!(res, "    \"world_id\": {},", room.world_id);
-			let _ = writeln!(res, "    \"lobby_id\": {},", room.lobby_id);
-			let _ = writeln!(res, "    \"max_slot\": {},", room.max_slot);
-			let _ = writeln!(res, "    \"cur_member_num\": {},", room.users.len());
-			let _ = writeln!(res, "    \"flag_attr\": {},", room.flag_attr);
-			let _ = writeln!(res, "    \"has_password\": {},", room.room_password.is_some());
-			res += "    \"members\": [\n";
-
-			for (i, user) in room.users.values().enumerate() {
-				let comma = if i != room.users.len() - 1 { "," } else { "" };
-				let _ = writeln!(
-					res,
-					"      {{ \"npid\": \"{}\", \"online_name\": \"{}\", \"is_owner\": {} }}{}",
-					sanitize_for_json(&user.npid),
-					sanitize_for_json(&user.online_name),
-					user.flag_attr & 0x80000000 != 0,
-					comma
-				);
-			}
-
-			res += "    ]\n";
-			res += "  }";
-		}
-
-		res += "\n]";
 		res
 	}
 }

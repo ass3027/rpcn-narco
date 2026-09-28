@@ -29,6 +29,7 @@ mod room_manager;
 use room_manager::RoomManager;
 mod score_cache;
 use score_cache::ScoresCache;
+mod api_server;
 mod daily_cleaner;
 mod game_specific_matchmaking;
 mod stat_server;
@@ -188,8 +189,8 @@ impl Server {
 			install_signal_handlers(&term_watch);
 
 			self.start_udp_server(term_watch.clone()).await?;
-			self.start_stat_server(term_watch.clone(), self.game_tracker.clone(), self.room_manager.clone(), self.db_pool.clone())
-				.await?;
+			self.start_stat_server(term_watch.clone(), self.game_tracker.clone()).await?;
+			self.start_api_server(term_watch.clone()).await?;
 			self.start_cleaner_task(term_watch.clone(), self.db_pool.clone(), self.client_infos.clone()).await;
 
 			let listener = TcpListener::bind(&addr).await.map_err(|e| io::Error::new(e.kind(), format!("Error binding to <{}>: {}", &addr, e)))?;
@@ -220,7 +221,7 @@ impl Server {
 						let fut_client = async move {
 							let mut stream = acceptor.accept(stream).await?;
 							stream.write_all(&servinfo_vec).await?;
-							let (mut client, mut tls_reader) = Client::new(config, stream, db_pool, shared, term_watch).await;
+							let (mut client, mut tls_reader) = Client::new(config, stream, db_pool, shared, term_watch, peer_addr.ip().to_canonical()).await;
 							client.process(&mut tls_reader).await;
 							Ok(()) as io::Result<()>
 						};
