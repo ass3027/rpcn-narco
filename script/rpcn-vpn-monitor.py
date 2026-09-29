@@ -15,6 +15,14 @@ SESSIONS_URL = "http://127.0.0.1:31315/admin/sessions"
 STATS_API_KEY = os.environ.get("RPCN_STAT_API_KEY", "")
 RPCN_PORT = 31313
 ZONE = "public"
+# 조회도 차단도 하지 않는 IP(쉼표 구분). 호스팅 대역이지만 정상인 접속용이다.
+# 예: 이 서버의 공인 IP. tag2now-BE는 공인 도메인으로 RPCN에 붙어 그 IP로 보인다.
+# 캐시에 기록하지 않으므로 목록에서 빼면 다음 주기에 다시 검사한다
+EXEMPT_IPS = {
+    str(ipaddress.ip_address(ip.strip()))
+    for ip in os.environ.get("RPCN_VPN_EXEMPT_IPS", "").split(",")
+    if ip.strip()
+}
 
 POLL_INTERVAL = 5
 LOOKUP_INTERVAL = 1.5
@@ -140,7 +148,7 @@ def block_ip(ip):
 
 def monitor_once(session, checked_ips, next_lookup_at):
     players = get_players(session)
-    unknown_ips = sorted({ip for _, _, ip in players if ip not in checked_ips})
+    unknown_ips = sorted({ip for _, _, ip in players if ip not in checked_ips} - EXEMPT_IPS)
 
     for ip in unknown_ips[:MAX_LOOKUPS_PER_CYCLE]:
         accounts = sorted(
@@ -175,6 +183,7 @@ def monitor_once(session, checked_ips, next_lookup_at):
 def monitor():
     checked_ips = load_state()
     next_lookup_at = 0
+    logger.info("예외 IP: %s", sorted(EXEMPT_IPS))
 
     with requests.Session() as session:
         while True:
