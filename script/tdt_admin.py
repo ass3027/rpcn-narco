@@ -16,7 +16,7 @@ verifies the result by md5. Nothing here touches the database.
     tdt_admin.py set-rank --input-file X.tdt [<npid> | --output-file Y.tdt] --char ... --rank ...
     tdt_admin.py set-account-rank <npid> --rank N|NAME
     tdt_admin.py apply <npid> --file PATH
-    tdt_admin.py floor <npid>... | --all [--rank N|NAME] [--label NAME] [--fix-points]
+    tdt_admin.py floor <npid>... | --all [--rank N|NAME] [--label NAME] [--fix-points] [--refloor]
     tdt_admin.py floor --input-file X.tdt [<npid> | --output-file Y.tdt] [--rank N|NAME] [--fix-points]
     tdt_admin.py floor --redo LABEL [<npid>...] [--label NAME]
     tdt_admin.py log [-n N]
@@ -79,6 +79,10 @@ FLOOR_POINTS[10] = 0
 ORANGE_TIER = 25  # Vanquisher, 주황단 시작
 FLOOR_POINTS.update({r: 5000 for r in range(11, ORANGE_TIER)})
 FLOOR_POINTS.update({r: 7000 for r in range(ORANGE_TIER, 43)})
+
+# floor는 59칸을 한 번에 올리므로, 이미 floor된 계정에서 floor 아래에 남는 것은 게임으로
+# 강등된 몇 칸뿐이다. 이 이하면 강등을 되돌리는 것으로 보고 건너뛴다 (--refloor로 무시)
+RESTORE_MAX = 15
 
 # --------------------------------------------------------------- checksum
 P = 0x1DB710641
@@ -686,6 +690,10 @@ def floor_buf(b, rank=None):
     return m, y, n
 
 
+def likely_demotions(raised):
+    return 0 < raised <= RESTORE_MAX
+
+
 def fix_floor_points(b, y):
     """characters sitting exactly at floor y with fewer points than FLOOR_POINTS[y] get
     FLOOR_POINTS[y] (e.g. left over from an older, lower floor value); returns how many"""
@@ -704,11 +712,12 @@ def _floor_summary(m, y, n, f, fix_points):
             f"{n:2d} raised{fixed}  ({rank_name(m)[1]})")
 
 
-def floor_account(npid, rank=None, who=None, label=None, dry_run=False, force=False, fix_points=False):
+def floor_account(npid, rank=None, who=None, label=None, dry_run=False, force=False, fix_points=False,
+                  refloor=False):
     """floor one account's live save.
 
     returns (status, move) with status one of
-    applied | dry_run | no_change | online | orphaned | failed
+    applied | dry_run | no_change | likely_demoted | online | orphaned | failed
     and move (reached tier, None, floor) for an account that needed raising, else None
     """
     try:
@@ -720,6 +729,9 @@ def floor_account(npid, rank=None, who=None, label=None, dry_run=False, force=Fa
     f = fix_floor_points(b, y) if fix_points else 0
     if n + f == 0:
         return "no_change", None
+    if likely_demotions(n) and not refloor:
+        print(f"  {npid:20s} skipped: {n} raised <= {RESTORE_MAX}, likely demotions (--refloor to apply)")
+        return "likely_demoted", None
     move = (rank_name(m)[1], None, y)
     if who is not None and npid in who and not force:
         print(f"  {npid:20s} skipped (online)")
@@ -883,7 +895,7 @@ def cmd_floor_redo(a):
 
 def cmd_floor(a):
     if a.redo:
-        if a.all or a.file or a.out or a.rank is not None or a.fix_points:
+        if a.all or a.file or a.out or a.rank is not None or a.fix_points or a.refloor:
             die("--redo takes only npids, --label, --dry-run and --force")
         return cmd_floor_redo(a)
     if a.rank is not None and a.rank not in FLOOR_POINTS:
@@ -916,10 +928,12 @@ def cmd_floor(a):
     print(f"{len(names)} accounts, floor {a.rank if a.rank is not None else 'auto'}, "
           f"backup label {label}{'  (dry run)' if a.dry_run else ''}")
 
-    count = dict.fromkeys(("applied", "dry_run", "no_change", "online", "orphaned", "failed"), 0)
+    count = dict.fromkeys(("applied", "dry_run", "no_change", "likely_demoted", "online", "orphaned",
+                           "failed"), 0)
     targets, moves = 0, Counter()
     for npid in names:
-        status, move = floor_account(npid, a.rank, who, label, a.dry_run, a.force, a.fix_points)
+        status, move = floor_account(npid, a.rank, who, label, a.dry_run, a.force, a.fix_points,
+                                     a.refloor)
         count[status] += 1
         targets += move is not None
         if status in ("applied", "dry_run"):
@@ -928,12 +942,13 @@ def cmd_floor(a):
 
     _report_moves(targets, moves)
     print(f"{'would apply' if a.dry_run else 'applied'} {done}  "
-          f"no change {count['no_change']}  online {count['online']}  "
-          f"orphaned {count['orphaned']}  failed {count['failed']}")
+          f"no change {count['no_change']}  likely demoted {count['likely_demoted']}  "
+          f"online {count['online']}  orphaned {count['orphaned']}  failed {count['failed']}")
     if not a.dry_run and len(names) > 1:
         audit("floor-batch", "-", accounts=done, targets=targets,
               moves={_move_label(m): n for m, n in moves.items()}, label=label, rank=a.rank,
-              fix_points=a.fix_points, skipped_online=count["online"],
+              fix_points=a.fix_points, refloor=a.refloor, likely_demoted=count["likely_demoted"],
+              skipped_online=count["online"],
               orphaned=count["orphaned"], failed=count["failed"])
 
 
@@ -1094,6 +1109,9 @@ def main():
     s.add_argument("--fix-points", action="store_true",
                    help="also give characters already at the floor rank the floor points "
                         "when they have fewer")
+    s.add_argument("--refloor", action="store_true",
+                   help=f"also floor accounts with {RESTORE_MAX} or fewer characters below the floor, "
+                        "which are normally skipped as demotions after an earlier floor")
     s.add_argument("--redo", metavar="LABEL",
                    help="re-run the floor backed up under LABEL with the current rule, only on "
                         "the characters it raised that have not been played since; "

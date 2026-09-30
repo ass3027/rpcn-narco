@@ -178,7 +178,7 @@ def run_once(st, dry_run):
             continue
         status, _ = ta.floor_account(npid, who=who, label=label, dry_run=dry_run)
         log(f"{npid} (created {created}): {status}")
-        if status in ("applied", "no_change") and not dry_run:
+        if status in ("applied", "no_change", "likely_demoted") and not dry_run:
             st["done"][npid] = {"ts": now(), "status": status}
             save_state(st)
 
