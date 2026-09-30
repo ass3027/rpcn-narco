@@ -39,8 +39,10 @@ import sqlite3
 import hashlib
 import argparse
 import subprocess
+import unicodedata
 import datetime as dt
 import urllib.request
+from collections import Counter
 
 REC = 3420
 COM_ID = "NPWR02973_00"
@@ -370,6 +372,32 @@ def rank_name(code):
     return RANKS.get(code, (f"Unknown ({code})", "Unknown"))
 
 
+# tier -> its lowest rank code, to list tiers from the top down
+_TIER_START = {}
+for _code, (_, _tier) in sorted(RANKS.items()):
+    _TIER_START.setdefault(_tier, _code)
+
+
+def _pad(s, width):
+    """ljust by terminal columns; 한글은 2칸을 차지한다"""
+    cols = sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in s)
+    return s + " " * max(width - cols, 0)
+
+
+def _move_label(move, tier_width=0):
+    """(tier, old floor or None, new floor) -> '(파랑단) Fighter -> Warrior' / '(파랑단) -> Warrior'"""
+    tier, old, new = move
+    src = "" if old is None else rank_name(old)[0] + " "
+    return f"{_pad(f'({tier})', tier_width)} {src}-> {rank_name(new)[0]}"
+
+
+def _report_moves(targets, moves):
+    """print how many accounts went where, highest reached tier first"""
+    print(f"대상자 {targets}명")
+    for move, n in sorted(moves.items(), key=lambda kv: (-_TIER_START[kv[0][0]], -kv[0][2])):
+        print(f"  {n:4d}명 {_move_label(move, 8)}")
+
+
 def _norm(s):
     return "".join(ch for ch in s.lower() if ch.isalnum())
 
@@ -636,10 +664,14 @@ def floor_for(m):
     return FLOOR_BY_TIER[reached[-1]] if reached else BASE_FLOOR
 
 
+def reached(b):
+    # 캐릭터는 강등되지만 계정 계급은 내려가지 않으므로 둘 중 최대를 도달 계급으로 본다
+    return max(max(b[CHAR_BASE + i * CHAR_STRIDE] for i in range(CHAR_N)), b[OFF_ACCOUNT_RANK])
+
+
 def floor_buf(b, rank=None):
     """raise every character and the account rank to the floor; returns (reached, floor, raised)"""
-    # 캐릭터는 강등되지만 계정 계급은 내려가지 않으므로 둘 중 최대를 도달 계급으로 본다
-    m = max(max(b[CHAR_BASE + i * CHAR_STRIDE] for i in range(CHAR_N)), b[OFF_ACCOUNT_RANK])
+    m = reached(b)
     y = floor_for(m) if rank is None else rank
     n = 0
     for i in range(CHAR_N):
@@ -667,36 +699,40 @@ def fix_floor_points(b, y):
 
 
 def _floor_summary(m, y, n, f, fix_points):
-    return f"reached {m:2d} -> floor {y:2d}, {n} slots raised" + (f", {f} points fixed" if fix_points else "")
+    fixed = f", {f} points fixed" if fix_points else ""
+    return (f"reached {m:2d} {rank_name(m)[0]:16s} -> floor {y:2d} {rank_name(y)[0]:16s} "
+            f"{n:2d} raised{fixed}  ({rank_name(m)[1]})")
 
 
 def floor_account(npid, rank=None, who=None, label=None, dry_run=False, force=False, fix_points=False):
     """floor one account's live save.
 
-    returns (status, changed) with status one of
+    returns (status, move) with status one of
     applied | dry_run | no_change | online | orphaned | failed
+    and move (reached tier, None, floor) for an account that needed raising, else None
     """
     try:
         _, _, _, path = lookup(npid)
         b = read_save(path)
     except SystemExit:
-        return "failed", 0
+        return "failed", None
     m, y, n = floor_buf(b, rank)
     f = fix_floor_points(b, y) if fix_points else 0
     if n + f == 0:
-        return "no_change", 0
+        return "no_change", None
+    move = (rank_name(m)[1], None, y)
     if who is not None and npid in who and not force:
         print(f"  {npid:20s} skipped (online)")
-        return "online", n + f
+        return "online", move
     print(f"  {npid:20s} {_floor_summary(m, y, n, f, fix_points)}")
     if dry_run:
-        return "dry_run", n + f
+        return "dry_run", move
     try:
         landed = _apply(npid, b, "floor", force, label=label, who=who, floor=y, raised=n,
                         **({"points_fixed": f} if fix_points else {}))
     except SystemExit:
-        return "failed", n + f
-    return ("applied" if landed else "orphaned"), n + f
+        return "failed", move
+    return ("applied" if landed else "orphaned"), move
 
 
 def _floor_file(a):
@@ -786,7 +822,8 @@ def cmd_floor_redo(a):
           f"{'  (dry run)' if a.dry_run else ''}")
 
     count = dict.fromkeys(("applied", "dry_run", "no_change", "online", "orphaned", "failed"), 0)
-    chars = kept = 0
+    kept = targets = 0
+    moves = Counter()
     for npid in names:
         r = entries[npid]
         try:
@@ -796,43 +833,51 @@ def cmd_floor_redo(a):
         except SystemExit:
             count["failed"] += 1
             continue
-        y_new, changes, played = redo_buf(pre, cur, r["floor"])
+        y_old = r["floor"]
+        y_new, changes, played = redo_buf(pre, cur, y_old)
         kept += len(played)
         if not changes:
             count["no_change"] += 1
             if detail:
-                print(f"  {npid:20s} floor {r['floor']} -> {y_new}: no change, kept played {played}")
+                print(f"  {npid:20s} floor {y_old} -> {y_new}: no change, kept played {played}")
             continue
+        targets += 1
         if npid in who and not a.force:
             count["online"] += 1
             print(f"  {npid:20s} skipped (online)")
             continue
-        print(f"  {npid:20s} floor {r['floor']:2d} -> {y_new:2d}: {len(changes)} changed, "
-              f"{len(played)} played since kept")
+        tier = rank_name(reached(pre))[1]
+        print(f"  {npid:20s} floor {y_old:2d} {rank_name(y_old)[0]:16s} -> {y_new:2d} "
+              f"{rank_name(y_new)[0]:16s} {len(changes):2d} changed, {len(played)} played since kept"
+              f"  ({tier})")
         if detail:
             for c, now, new in changes:
                 name = "account rank" if c == "account" else f"{c:2d} {CHARACTERS.get(c, c)}"
                 print(f"      {name:18s} {now} -> {new}")
             if played:
                 print(f"      kept (played since): {[(c, CHARACTERS.get(c, c)) for c in played]}")
-        chars += len(changes)
         if a.dry_run:
             count["dry_run"] += 1
+            moves[(tier, y_old, y_new)] += 1
             continue
         try:
             landed = _apply(npid, cur, "floor-redo", a.force, label=label, who=who, redo=a.redo,
-                            floor_old=r["floor"], floor=y_new, changed=len(changes), kept=len(played))
+                            floor_old=y_old, floor=y_new, changed=len(changes), kept=len(played))
         except SystemExit:
             count["failed"] += 1
             continue
         count["applied" if landed else "orphaned"] += 1
+        if landed:
+            moves[(tier, y_old, y_new)] += 1
 
     done = count["dry_run"] if a.dry_run else count["applied"]
-    print(f"{'would apply' if a.dry_run else 'applied'} {done}  slots {chars:,}  played kept {kept}  "
+    _report_moves(targets, moves)
+    print(f"{'would apply' if a.dry_run else 'applied'} {done}  played chars kept {kept}  "
           f"no change {count['no_change']}  online {count['online']}  "
           f"orphaned {count['orphaned']}  failed {count['failed']}")
     if not a.dry_run and len(names) > 1:
-        audit("floor-redo-batch", "-", redo=a.redo, accounts=done, slots=chars, kept=kept, label=label,
+        audit("floor-redo-batch", "-", redo=a.redo, accounts=done, targets=targets,
+              moves={_move_label(m): n for m, n in moves.items()}, kept=kept, label=label,
               skipped_online=count["online"], orphaned=count["orphaned"], failed=count["failed"])
 
 
@@ -872,19 +917,22 @@ def cmd_floor(a):
           f"backup label {label}{'  (dry run)' if a.dry_run else ''}")
 
     count = dict.fromkeys(("applied", "dry_run", "no_change", "online", "orphaned", "failed"), 0)
-    chars = 0
+    targets, moves = 0, Counter()
     for npid in names:
-        status, n = floor_account(npid, a.rank, who, label, a.dry_run, a.force, a.fix_points)
+        status, move = floor_account(npid, a.rank, who, label, a.dry_run, a.force, a.fix_points)
         count[status] += 1
+        targets += move is not None
         if status in ("applied", "dry_run"):
-            chars += n
+            moves[move] += 1
     done = count["dry_run"] if a.dry_run else count["applied"]
 
-    print(f"{'would apply' if a.dry_run else 'applied'} {done}  slots {chars:,}  "
+    _report_moves(targets, moves)
+    print(f"{'would apply' if a.dry_run else 'applied'} {done}  "
           f"no change {count['no_change']}  online {count['online']}  "
           f"orphaned {count['orphaned']}  failed {count['failed']}")
     if not a.dry_run and len(names) > 1:
-        audit("floor-batch", "-", accounts=done, slots=chars, label=label, rank=a.rank,
+        audit("floor-batch", "-", accounts=done, targets=targets,
+              moves={_move_label(m): n for m, n in moves.items()}, label=label, rank=a.rank,
               fix_points=a.fix_points, skipped_online=count["online"],
               orphaned=count["orphaned"], failed=count["failed"])
 
