@@ -730,7 +730,9 @@ def floor_account(npid, rank=None, who=None, label=None, dry_run=False, force=Fa
     if n + f == 0:
         return "no_change", None
     if likely_demotions(n) and not refloor:
-        print(f"  {npid:20s} skipped: {n} raised <= {RESTORE_MAX}, likely demotions (--refloor to apply)")
+        # 같은 계정이 매 실행마다 반복되므로 실제 실행 로그에는 요약의 개수만 남긴다
+        if dry_run:
+            print(f"  {npid:20s} skipped: {n} raised <= {RESTORE_MAX}, likely demotions (--refloor to apply)")
         return "likely_demoted", None
     move = (rank_name(m)[1], None, y)
     if who is not None and npid in who and not force:
